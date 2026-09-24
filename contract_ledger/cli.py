@@ -1,7 +1,7 @@
 """Command-line entry point.
 
-合同与变更单台账：所有业务数据保存在项目内固定位置的本地
-SQLite 数据库文件（``.contract_ledger/ledger.db``），仅使用
+合同、付款里程碑与变更单台账：所有业务数据保存在项目内固定位置的
+本地 SQLite 数据库文件（``.contract_ledger/ledger.db``），仅使用
 Python 3.12 标准库。每次写操作在单个事务内完成，任何校验失败
 都会整体回滚，不会留下半写入记录。
 """
@@ -72,14 +72,39 @@ def init_db(conn: sqlite3.Connection) -> None:
             code         TEXT NOT NULL UNIQUE,
             contract_id  INTEGER NOT NULL
                                  REFERENCES contracts(id),
+            milestone_id INTEGER
+                                 REFERENCES milestones(id),
             description  TEXT NOT NULL,
             delta_cents  INTEGER NOT NULL CHECK (delta_cents <> 0),
             status       TEXT NOT NULL
                                  CHECK (status IN ('draft', 'effective', 'void')),
-            seq          INTEGER NOT NULL
+            seq          INTEGER NOT NULL,
+            effective_date TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS milestones (
+            id            INTEGER PRIMARY KEY,
+            code          TEXT NOT NULL UNIQUE,
+            contract_id   INTEGER NOT NULL
+                                  REFERENCES contracts(id),
+            name          TEXT NOT NULL,
+            amount_cents  INTEGER NOT NULL CHECK (amount_cents > 0),
+            due_date      TEXT NOT NULL,
+            seq           INTEGER NOT NULL
         );
         """
     )
+    # 既有数据库的 changes 表可能缺少后增列，按需补齐。
+    change_cols = {
+        row[1] for row in conn.execute("PRAGMA table_info(changes)")
+    }
+    if "milestone_id" not in change_cols:
+        conn.execute(
+            "ALTER TABLE changes ADD COLUMN milestone_id INTEGER"
+            " REFERENCES milestones(id)"
+        )
+    if "effective_date" not in change_cols:
+        conn.execute("ALTER TABLE changes ADD COLUMN effective_date TEXT")
     conn.commit()
 
 
@@ -114,15 +139,20 @@ def parse_amount(text: str, *, field: str, allow_negative: bool) -> int:
     return cents
 
 
-def parse_signed_date(text: str) -> str:
+def parse_date(text: str, *, field: str) -> str:
     """校验 YYYY-MM-DD 日期并返回规范化文本。"""
     try:
         parsed = date.fromisoformat(text)
     except ValueError:
-        raise LedgerError(f"签订日期不合法：{text!r}（应为 YYYY-MM-DD）")
+        raise LedgerError(f"{field}不合法：{text!r}（应为 YYYY-MM-DD）")
     if parsed.isoformat() != text:
-        raise LedgerError(f"签订日期不合法：{text!r}（应为 YYYY-MM-DD）")
+        raise LedgerError(f"{field}不合法：{text!r}（应为 YYYY-MM-DD）")
     return parsed.isoformat()
+
+
+def parse_signed_date(text: str) -> str:
+    """校验合同签订日期。"""
+    return parse_date(text, field="签订日期")
 
 
 def require_text(value: str | None, field: str) -> str:
@@ -157,6 +187,12 @@ def get_change(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
     ).fetchone()
 
 
+def get_milestone(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM milestones WHERE code = ?", (code,)
+    ).fetchone()
+
+
 def current_cents(conn: sqlite3.Connection, contract_id: int) -> int:
     row = conn.execute(
         """
@@ -171,6 +207,96 @@ def current_cents(conn: sqlite3.Connection, contract_id: int) -> int:
         (contract_id,),
     ).fetchone()
     return int(row[0])
+
+
+def milestone_current_cents(conn: sqlite3.Connection, milestone_id: int) -> int:
+    """里程碑当前金额 = 初始金额 + 该里程碑下已生效且未作废变更合计。"""
+    row = conn.execute(
+        """
+        SELECT m.amount_cents + COALESCE(SUM(ch.delta_cents), 0)
+          FROM milestones AS m
+          LEFT JOIN changes AS ch
+            ON ch.milestone_id = m.id
+           AND ch.status = 'effective'
+         WHERE m.id = ?
+         GROUP BY m.id
+        """,
+        (milestone_id,),
+    ).fetchone()
+    return int(row[0])
+
+
+def register_milestone(
+    conn: sqlite3.Connection,
+    contract_code: str,
+    code: str,
+    name: str,
+    amount_text: str,
+    due_text: str,
+) -> tuple[str, int]:
+    contract_code = require_text(contract_code, "合同编号")
+    code = require_text(code, "里程碑编号")
+    name = require_text(name, "里程碑名称")
+    amount_cents = parse_amount(
+        amount_text, field="里程碑金额", allow_negative=False
+    )
+    due_date = parse_date(due_text, field="到期日")
+    contract = get_contract(conn, contract_code)
+    if contract is None:
+        raise LedgerError(f"引用的合同编号不存在：{contract_code}")
+    if get_milestone(conn, code) is not None:
+        raise LedgerError(f"里程碑编号已存在，不得重复登记：{code}")
+    if due_date < contract["signed_date"]:
+        raise LedgerError(
+            f"到期日不得早于合同签订日期（{contract['signed_date']}）：{due_date}"
+        )
+    next_seq = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM milestones WHERE contract_id = ?",
+        (contract["id"],),
+    ).fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO milestones
+            (code, contract_id, name, amount_cents, due_date, seq)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (code, contract["id"], name, amount_cents, due_date, next_seq),
+    )
+    return code, amount_cents
+
+
+def set_milestone_due(
+    conn: sqlite3.Connection, code: str, due_text: str
+) -> tuple[str, str]:
+    code = require_text(code, "里程碑编号")
+    due_date = parse_date(due_text, field="到期日")
+    milestone = get_milestone(conn, code)
+    if milestone is None:
+        raise LedgerError(f"里程碑编号不存在：{code}")
+    contract = conn.execute(
+        "SELECT * FROM contracts WHERE id = ?", (milestone["contract_id"],)
+    ).fetchone()
+    if due_date < contract["signed_date"]:
+        raise LedgerError(
+            f"到期日不得早于合同签订日期（{contract['signed_date']}）：{due_date}"
+        )
+    latest_effective = conn.execute(
+        """
+        SELECT MAX(effective_date) FROM changes
+         WHERE milestone_id = ? AND status = 'effective'
+        """,
+        (milestone["id"],),
+    ).fetchone()[0]
+    if latest_effective is not None and due_date < latest_effective:
+        raise LedgerError(
+            f"到期日不得早于该里程碑已生效变更单的最晚生效日期"
+            f"（{latest_effective}）：{due_date}"
+        )
+    conn.execute(
+        "UPDATE milestones SET due_date = ? WHERE id = ?",
+        (due_date, milestone["id"]),
+    )
+    return code, due_date
 
 
 def register_contract(
@@ -204,6 +330,7 @@ def register_change(
     change_code: str,
     description: str,
     delta_text: str,
+    milestone_code: str | None = None,
 ) -> str:
     contract_code = require_text(contract_code, "合同编号")
     change_code = require_text(change_code, "变更单编号")
@@ -216,6 +343,17 @@ def register_change(
         raise LedgerError(f"引用的合同编号不存在：{contract_code}")
     if get_change(conn, change_code) is not None:
         raise LedgerError(f"变更单编号已存在，不得重复登记：{change_code}")
+    milestone_id = None
+    if milestone_code is not None:
+        milestone_code = require_text(milestone_code, "里程碑编号")
+        milestone = get_milestone(conn, milestone_code)
+        if milestone is None:
+            raise LedgerError(f"里程碑编号不存在：{milestone_code}")
+        if milestone["contract_id"] != contract["id"]:
+            raise LedgerError(
+                f"里程碑 {milestone_code} 不属于合同 {contract_code}"
+            )
+        milestone_id = milestone["id"]
     next_seq = conn.execute(
         "SELECT COALESCE(MAX(seq), 0) + 1 FROM changes WHERE contract_id = ?",
         (contract["id"],),
@@ -223,10 +361,12 @@ def register_change(
     conn.execute(
         """
         INSERT INTO changes
-            (code, contract_id, description, delta_cents, status, seq)
-        VALUES (?, ?, ?, ?, 'draft', ?)
+            (code, contract_id, milestone_id, description, delta_cents,
+             status, seq)
+        VALUES (?, ?, ?, ?, ?, 'draft', ?)
         """,
-        (change_code, contract["id"], description, delta_cents, next_seq),
+        (change_code, contract["id"], milestone_id, description,
+         delta_cents, next_seq),
     )
     return change_code
 
@@ -265,10 +405,27 @@ def _transition(
                 f"{verb}后合同当前金额将小于等于零，拒绝{verb}：{change_code}"
             )
 
-    conn.execute(
-        "UPDATE changes SET status = ? WHERE id = ?",
-        (new_status, change["id"]),
-    )
+    # 里程碑变更单生效的额外校验：生效后该里程碑当前金额必须大于零。
+    if action == "effect" and change["milestone_id"] is not None:
+        projected_ms = (
+            milestone_current_cents(conn, change["milestone_id"])
+            + change["delta_cents"]
+        )
+        if projected_ms <= 0:
+            raise LedgerError(
+                f"生效后里程碑当前金额将小于等于零，拒绝生效：{change_code}"
+            )
+
+    if action == "effect":
+        conn.execute(
+            "UPDATE changes SET status = ?, effective_date = ? WHERE id = ?",
+            (new_status, date.today().isoformat(), change["id"]),
+        )
+    else:
+        conn.execute(
+            "UPDATE changes SET status = ? WHERE id = ?",
+            (new_status, change["id"]),
+        )
     return conn.execute("SELECT * FROM changes WHERE id = ?", (change["id"],)).fetchone()
 
 
@@ -280,16 +437,28 @@ def void_change(conn: sqlite3.Connection, change_code: str) -> sqlite3.Row:
     return _transition(conn, change_code, action="void")
 
 
-def query_contract(conn: sqlite3.Connection, code: str) -> tuple[sqlite3.Row, list[sqlite3.Row]]:
+def query_contract(
+    conn: sqlite3.Connection, code: str
+) -> tuple[sqlite3.Row, list[sqlite3.Row], list[sqlite3.Row]]:
     code = require_text(code, "合同编号")
     contract = get_contract(conn, code)
     if contract is None:
         raise LedgerError(f"合同编号不存在：{code}")
     changes = conn.execute(
-        "SELECT * FROM changes WHERE contract_id = ? ORDER BY seq",
+        """
+        SELECT ch.*, ms.code AS milestone_code
+          FROM changes AS ch
+          LEFT JOIN milestones AS ms ON ms.id = ch.milestone_id
+         WHERE ch.contract_id = ?
+         ORDER BY ch.seq
+        """,
         (contract["id"],),
     ).fetchall()
-    return contract, changes
+    milestones = conn.execute(
+        "SELECT * FROM milestones WHERE contract_id = ? ORDER BY seq",
+        (contract["id"],),
+    ).fetchall()
+    return contract, changes, milestones
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +495,36 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--code", required=True, help="变更单编号（全局唯一）")
     p.add_argument("--description", required=True, help="变更说明（非空）")
     p.add_argument("--delta", required=True, help="金额变动（元，可正可负，不得为零）")
+    p.add_argument(
+        "--milestone",
+        default=None,
+        help="归属里程碑编号（可选；省略则归属合同总额）",
+    )
     p.set_defaults(handler=cmd_register_change)
+
+    p = subparsers.add_parser(
+        "register-milestone",
+        aliases=["add-milestone"],
+        help="登记付款里程碑",
+        description="为已有合同登记付款里程碑。里程碑编号全局唯一，金额为正数，"
+                    "到期日不得早于合同签订日期。",
+    )
+    p.add_argument("--contract", required=True, help="所属合同编号")
+    p.add_argument("--code", required=True, help="里程碑编号（全局唯一）")
+    p.add_argument("--name", required=True, help="里程碑名称（非空）")
+    p.add_argument("--amount", required=True, help="金额（元，正数，最多两位小数）")
+    p.add_argument("--due", required=True, help="到期日（YYYY-MM-DD）")
+    p.set_defaults(handler=cmd_register_milestone)
+
+    p = subparsers.add_parser(
+        "set-milestone-due",
+        help="更新里程碑到期日",
+        description="更新里程碑到期日；不得早于合同签订日期，也不得早于该里程碑"
+                    "已生效变更单的最晚生效日期。",
+    )
+    p.add_argument("--code", required=True, help="里程碑编号")
+    p.add_argument("--due", required=True, help="新到期日（YYYY-MM-DD）")
+    p.set_defaults(handler=cmd_set_milestone_due)
 
     p = subparsers.add_parser(
         "effect-change",
@@ -369,9 +567,28 @@ def cmd_register_contract(args: argparse.Namespace, conn: sqlite3.Connection) ->
 def cmd_register_change(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     with conn:
         code = register_change(
-            conn, args.contract, args.code, args.description, args.delta
+            conn, args.contract, args.code, args.description, args.delta,
+            milestone_code=args.milestone,
         )
     print(f"变更单已登记（草稿）：{code}")
+    return 0
+
+
+def cmd_register_milestone(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:
+        code, amount_cents = register_milestone(
+            conn, args.contract, args.code, args.name, args.amount, args.due
+        )
+    print(f"里程碑编号：{code}")
+    print(f"当前金额：{format_yuan(amount_cents)}")
+    return 0
+
+
+def cmd_set_milestone_due(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:
+        code, due_date = set_milestone_due(conn, args.code, args.due)
+    print(f"里程碑编号：{code}")
+    print(f"到期日：{due_date}")
     return 0
 
 
@@ -394,19 +611,30 @@ def cmd_void_change(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
 
 
 def cmd_query_contract(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
-    contract, changes = query_contract(conn, args.code)
+    contract, changes, milestones = query_contract(conn, args.code)
     amount = current_cents(conn, contract["id"])
     print(f"合同编号：{contract['code']}")
     print(f"客户名称：{contract['customer']}")
     print(f"签订日期：{contract['signed_date']}")
     print(f"初始金额：{format_yuan(contract['initial_cents'])}")
     print(f"当前金额：{format_yuan(amount)}")
+    if milestones:
+        print("里程碑：")
+        for ms in milestones:
+            ms_amount = milestone_current_cents(conn, ms["id"])
+            print(
+                f"  - {ms['code']}  名称：{ms['name']}  "
+                f"到期日：{ms['due_date']}  当前金额：{format_yuan(ms_amount)}"
+            )
+    else:
+        print("里程碑：无")
     if changes:
         print("变更单：")
         for ch in changes:
+            owner = ch["milestone_code"] if ch["milestone_code"] else "合同"
             print(
                 f"  - {ch['code']}  变动：{format_yuan(ch['delta_cents'])}  "
-                f"状态：{STATUS_LABELS[ch['status']]}"
+                f"状态：{STATUS_LABELS[ch['status']]}  归属：{owner}"
             )
     else:
         print("变更单：无")

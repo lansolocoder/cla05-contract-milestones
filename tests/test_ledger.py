@@ -4,6 +4,7 @@
 指定），测试结束后清理，不污染项目内默认数据库。
 """
 
+from datetime import date, timedelta
 from pathlib import Path
 import os
 import shutil
@@ -48,12 +49,27 @@ class CLIHarness:
         )
 
     def register_change(self, contract="C001", code="CHG01",
-                        description="追加需求", delta="2000"):
-        return self.invoke(
+                        description="追加需求", delta="2000",
+                        milestone=None):
+        args = [
             "register-change",
             "--contract", contract, "--code", code,
             "--description", description, "--delta", delta,
+        ]
+        if milestone is not None:
+            args += ["--milestone", milestone]
+        return self.invoke(*args)
+
+    def register_milestone(self, contract="C001", code="MS01",
+                           name="首付款", amount="3000", due="2026-06-30"):
+        return self.invoke(
+            "register-milestone",
+            "--contract", contract, "--code", code, "--name", name,
+            "--amount", amount, "--due", due,
         )
+
+    def set_milestone_due(self, code="MS01", due="2026-07-31"):
+        return self.invoke("set-milestone-due", "--code", code, "--due", due)
 
     def query(self, code="C001"):
         return self.invoke("query-contract", "--code", code)
@@ -367,6 +383,171 @@ class LifecyclePersistenceTests(unittest.TestCase):
         self.assertIn("当前金额：800", result.stdout)
         self.assertIn("已作废", result.stdout)
         self.assertIn("已生效", result.stdout)
+
+
+class MilestoneRegistrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cli = CLIHarness()
+        self.addCleanup(self.cli.cleanup)
+        self.assertEqual(self.cli.register_contract().returncode, 0)
+
+    def test_register_success_outputs_code(self) -> None:
+        result = self.cli.register_milestone()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MS01", result.stdout)
+        self.assertEqual(result.stderr, "")
+
+    def test_duplicate_milestone_fails_and_keeps_data(self) -> None:
+        self.assertEqual(self.cli.register_milestone().returncode, 0)
+        second = self.cli.register_milestone(name="另一个", amount="1")
+        self.assertNotEqual(second.returncode, 0)
+        self.assertIn("MS01", second.stderr)
+        query = self.cli.query()
+        self.assertIn("名称：首付款", query.stdout)
+        self.assertNotIn("另一个", query.stdout)
+
+    def test_register_on_nonexistent_contract_fails(self) -> None:
+        result = self.cli.register_milestone(contract="NOPE")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不存在", result.stderr)
+
+    def test_invalid_amount_or_blank_name_fails(self) -> None:
+        for bad in ["0", "-1", "1.234", "abc"]:
+            with self.subTest(bad=bad):
+                result = self.cli.register_milestone(code=f"M-{bad}", amount=bad)
+                self.assertNotEqual(result.returncode, 0)
+        result = self.cli.register_milestone(code="M-BLANK", name="  ")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("里程碑名称", result.stderr)
+
+    def test_due_before_signed_date_fails(self) -> None:
+        result = self.cli.register_milestone(due="2026-01-14")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("签订日期", result.stderr)
+        self.assertIn("里程碑：无", self.cli.query().stdout)
+
+    def test_invalid_due_format_fails(self) -> None:
+        for bad in ["2026-13-01", "2026/06/30", "2026-6-30"]:
+            with self.subTest(bad=bad):
+                result = self.cli.register_milestone(code=f"D-{bad}", due=bad)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("到期日", result.stderr)
+
+
+class MilestoneDueTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cli = CLIHarness()
+        self.addCleanup(self.cli.cleanup)
+        self.assertEqual(self.cli.register_contract().returncode, 0)
+        self.assertEqual(self.cli.register_milestone().returncode, 0)
+
+    def test_update_due_success(self) -> None:
+        result = self.cli.set_milestone_due(due="2026-07-31")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("MS01", result.stdout)
+        self.assertIn("2026-07-31", result.stdout)
+        self.assertIn("到期日：2026-07-31", self.cli.query().stdout)
+
+    def test_unknown_milestone_fails(self) -> None:
+        result = self.cli.set_milestone_due(code="NOPE")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不存在", result.stderr)
+
+    def test_due_before_signed_date_fails_and_keeps_old(self) -> None:
+        result = self.cli.set_milestone_due(due="2026-01-01")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("签订日期", result.stderr)
+        self.assertIn("到期日：2026-06-30", self.cli.query().stdout)
+
+    def test_due_before_latest_effective_change_fails(self) -> None:
+        # 变更生效日期为今天；新到期日不得早于它。
+        self.cli.register_change(code="C-EFF", delta="100", milestone="MS01")
+        self.assertEqual(
+            self.cli.invoke("effect-change", "--code", "C-EFF").returncode, 0
+        )
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        result = self.cli.set_milestone_due(due=yesterday)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("生效日期", result.stderr)
+        self.assertIn("到期日：2026-06-30", self.cli.query().stdout)
+
+
+class MilestoneChangeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cli = CLIHarness()
+        self.addCleanup(self.cli.cleanup)
+        self.assertEqual(self.cli.register_contract().returncode, 0)
+        self.assertEqual(self.cli.register_milestone().returncode, 0)
+
+    def test_change_with_milestone_listed_with_owner(self) -> None:
+        result = self.cli.register_change(code="CM1", delta="500", milestone="MS01")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        query = self.cli.query()
+        self.assertIn("归属：MS01", query.stdout)
+
+    def test_change_without_milestone_keeps_contract_owner(self) -> None:
+        self.assertEqual(self.cli.register_change(delta="100").returncode, 0)
+        self.assertIn("归属：合同", self.cli.query().stdout)
+
+    def test_unknown_milestone_rejected(self) -> None:
+        result = self.cli.register_change(code="CX", delta="10", milestone="NOPE")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不存在", result.stderr)
+
+    def test_milestone_of_other_contract_rejected(self) -> None:
+        self.cli.register_contract(code="C002", customer="乙", amount="100")
+        result = self.cli.register_change(
+            contract="C002", code="CX", delta="10", milestone="MS01"
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不属于", result.stderr)
+
+    def test_effect_rejected_when_milestone_amount_not_positive(self) -> None:
+        # 里程碑初始 3000：-3000 生效后里程碑金额为零，必须拒绝。
+        self.cli.register_change(code="BIG", delta="-3000", milestone="MS01")
+        result = self.cli.invoke("effect-change", "--code", "BIG")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("小于等于零", result.stderr)
+        query = self.cli.query()
+        self.assertIn("当前金额：3000", query.stdout)  # 里程碑金额不变
+        self.assertIn("当前金额：10000", query.stdout)  # 合同金额不变
+
+    def test_effect_allowed_when_milestone_stays_positive(self) -> None:
+        self.cli.register_change(code="OK", delta="-2999.99", milestone="MS01")
+        result = self.cli.invoke("effect-change", "--code", "OK")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("当前金额：0.01", self.cli.query().stdout)
+
+    def test_void_draft_milestone_change_skips_check(self) -> None:
+        self.cli.register_change(code="VD", delta="-99999", milestone="MS01")
+        result = self.cli.invoke("void-change", "--code", "VD")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class MilestoneQueryTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cli = CLIHarness()
+        self.addCleanup(self.cli.cleanup)
+
+    def test_no_milestone_outputs_none(self) -> None:
+        self.cli.register_contract()
+        result = self.cli.query()
+        self.assertIn("里程碑：无", result.stdout)
+
+    def test_milestones_listed_in_registration_order_with_current_amount(self) -> None:
+        self.cli.register_contract()
+        self.cli.register_milestone(code="MA", name="一期", amount="1000",
+                                    due="2026-03-01")
+        self.cli.register_milestone(code="MB", name="二期", amount="2000.50",
+                                    due="2026-09-01")
+        self.cli.register_change(code="CA", delta="-100", milestone="MA")
+        self.cli.invoke("effect-change", "--code", "CA")
+        result = self.cli.query()
+        self.assertLess(result.stdout.index("- MA"), result.stdout.index("- MB"))
+        self.assertIn("MA  名称：一期  到期日：2026-03-01  当前金额：900",
+                      result.stdout)
+        self.assertIn("MB  名称：二期  到期日：2026-09-01  当前金额：2000.5",
+                      result.stdout)
 
 
 if __name__ == "__main__":
