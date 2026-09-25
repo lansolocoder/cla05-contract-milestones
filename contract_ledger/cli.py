@@ -31,6 +31,11 @@ DRAFT = "draft"
 EFFECTIVE = "effective"
 VOID = "void"
 
+#: 发票状态（字面值即存储值，查询时原样输出）。
+INVOICE_UNPAID = "unpaid"
+INVOICE_PAID = "paid"
+INVOICE_VOID = "void"
+
 STATUS_LABELS = {
     DRAFT: "草稿",
     EFFECTIVE: "已生效",
@@ -95,6 +100,37 @@ def init_db(conn: sqlite3.Connection) -> None:
                                   CHECK (status IN ('draft', 'effective', 'void')),
             effective_date TEXT,
             seq           INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS invoices (
+            id            INTEGER PRIMARY KEY,
+            code          TEXT NOT NULL UNIQUE,
+            contract_id   INTEGER NOT NULL
+                                  REFERENCES contracts(id),
+            milestone_id  INTEGER NOT NULL
+                                  REFERENCES milestones(id),
+            amount_cents  INTEGER NOT NULL CHECK (amount_cents > 0),
+            issue_date    TEXT NOT NULL,
+            status        TEXT NOT NULL
+                                  CHECK (status IN ('unpaid', 'paid', 'void')),
+            seq           INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS payments (
+            id            INTEGER PRIMARY KEY,
+            code          TEXT NOT NULL UNIQUE,
+            invoice_id    INTEGER NOT NULL
+                                  REFERENCES invoices(id),
+            amount_cents  INTEGER NOT NULL CHECK (amount_cents > 0),
+            pay_date      TEXT NOT NULL,
+            seq           INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS overpayments (
+            id            INTEGER PRIMARY KEY,
+            contract_id   INTEGER NOT NULL UNIQUE
+                                  REFERENCES contracts(id),
+            amount_cents  INTEGER NOT NULL DEFAULT 0
         );
         """
     )
@@ -478,6 +514,187 @@ def query_contract(
 
 
 # ---------------------------------------------------------------------------
+# 发票与收款（均在调用方提供的事务内执行）
+# ---------------------------------------------------------------------------
+
+def get_invoice(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM invoices WHERE code = ?", (code,)
+    ).fetchone()
+
+
+def get_payment(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM payments WHERE code = ?", (code,)
+    ).fetchone()
+
+
+def invoice_paid_cents(conn: sqlite3.Connection, invoice_id: int) -> int:
+    """该发票下全部收款单的金额合计（整数分）。"""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE invoice_id = ?",
+        (invoice_id,),
+    ).fetchone()
+    return int(row[0])
+
+
+def contract_overpayment_cents(conn: sqlite3.Connection, contract_id: int) -> int:
+    """该合同累计超额收款余额；从未发生超收时为 0。"""
+    row = conn.execute(
+        """
+        SELECT COALESCE(
+            (SELECT amount_cents FROM overpayments WHERE contract_id = ?), 0
+        )
+        """,
+        (contract_id,),
+    ).fetchone()
+    return int(row[0])
+
+
+def _add_overpayment(
+    conn: sqlite3.Connection, contract_id: int, cents: int
+) -> None:
+    """把超额部分累加进合同的超额收款余额（Upsert，原子）。"""
+    conn.execute(
+        """
+        INSERT INTO overpayments (contract_id, amount_cents)
+        VALUES (?, ?)
+        ON CONFLICT(contract_id) DO UPDATE
+            SET amount_cents = amount_cents + excluded.amount_cents
+        """,
+        (contract_id, cents),
+    )
+
+
+def issue_invoice(
+    conn: sqlite3.Connection,
+    invoice_code: str,
+    milestone_code: str,
+    amount_text: str,
+    issue_date_text: str,
+) -> tuple[str, str, int]:
+    """登记发票。
+
+    发票号经 --contract 传入（沿用命令行参数命名）；合同由里程碑
+    归属确定：里程碑必须存在，开票日期不得早于其所属合同签订日期。
+    """
+    invoice_code = require_text(invoice_code, "发票号")
+    milestone_code = require_text(milestone_code, "里程碑编号")
+    amount_cents = parse_amount(
+        amount_text, field="发票金额", allow_negative=False
+    )
+    issue_date = parse_iso_date(issue_date_text, field="开票日期")
+    milestone = get_milestone(conn, milestone_code)
+    if milestone is None:
+        raise LedgerError(f"里程碑编号不存在：{milestone_code}")
+    contract = get_contract_by_id(conn, milestone["contract_id"])
+    if get_invoice(conn, invoice_code) is not None:
+        raise LedgerError(f"发票号已存在，不得重复登记：{invoice_code}")
+    if issue_date < contract["signed_date"]:
+        raise LedgerError(
+            f"开票日期不得早于合同签订日期："
+            f"{issue_date} 早于 {contract['signed_date']}"
+        )
+    next_seq = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM invoices WHERE contract_id = ?",
+        (contract["id"],),
+    ).fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO invoices
+            (code, contract_id, milestone_id, amount_cents, issue_date, status, seq)
+        VALUES (?, ?, ?, ?, ?, 'unpaid', ?)
+        """,
+        (invoice_code, contract["id"], milestone["id"],
+         amount_cents, issue_date, next_seq),
+    )
+    return invoice_code, milestone_code, amount_cents
+
+
+def record_payment(
+    conn: sqlite3.Connection,
+    invoice_code: str,
+    payment_code: str,
+    amount_text: str,
+    pay_date_text: str,
+) -> sqlite3.Row:
+    invoice_code = require_text(invoice_code, "发票号")
+    payment_code = require_text(payment_code, "收款单号")
+    amount_cents = parse_amount(
+        amount_text, field="收款金额", allow_negative=False
+    )
+    pay_date = parse_iso_date(pay_date_text, field="收款日期")
+    invoice = get_invoice(conn, invoice_code)
+    if invoice is None:
+        raise LedgerError(f"发票号不存在：{invoice_code}")
+    if invoice["status"] == INVOICE_VOID:
+        raise LedgerError(f"发票已作废，不可再登记收款：{invoice_code}")
+    if pay_date < invoice["issue_date"]:
+        raise LedgerError(
+            f"收款日期不得早于发票日期：{pay_date} 早于 {invoice['issue_date']}"
+        )
+    if get_payment(conn, payment_code) is not None:
+        raise LedgerError(f"收款单号已存在，不得重复登记：{payment_code}")
+
+    paid_before = invoice_paid_cents(conn, invoice["id"])
+    invoice_amount = int(invoice["amount_cents"])
+    # 按发票金额入账：本笔最多补齐发票未收部分，其余转为合同超收余额。
+    excess_cents = max(0, paid_before + amount_cents - invoice_amount)
+    next_seq = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM payments WHERE invoice_id = ?",
+        (invoice["id"],),
+    ).fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO payments (code, invoice_id, amount_cents, pay_date, seq)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (payment_code, invoice["id"], amount_cents, pay_date, next_seq),
+    )
+    if excess_cents > 0:
+        _add_overpayment(conn, invoice["contract_id"], excess_cents)
+    # 累计收款恰好等于或（因超收）大于发票金额，均立即置为 paid。
+    if paid_before + amount_cents >= invoice_amount:
+        conn.execute(
+            "UPDATE invoices SET status = 'paid' WHERE id = ?", (invoice["id"],)
+        )
+    return conn.execute(
+        "SELECT * FROM invoices WHERE id = ?", (invoice["id"],)
+    ).fetchone()
+
+
+def query_payment(
+    conn: sqlite3.Connection, contract_code: str
+) -> tuple[list[sqlite3.Row], int]:
+    """返回合同下全部发票（登记先后）及合同累计超收余额。
+
+    每行附带 paid_total_cents（该发票全部收款合计）、
+    received_cents（已收金额，封顶发票金额）、
+    over_cents（该发票对应的超收余额）。
+    """
+    contract_code = require_text(contract_code, "合同编号")
+    contract = get_contract(conn, contract_code)
+    if contract is None:
+        raise LedgerError(f"合同编号不存在：{contract_code}")
+    invoices = conn.execute(
+        """
+        SELECT i.*,
+               COALESCE(SUM(p.amount_cents), 0) AS paid_total_cents,
+               m.code AS milestone_code
+          FROM invoices AS i
+          JOIN milestones AS m ON m.id = i.milestone_id
+          LEFT JOIN payments AS p ON p.invoice_id = i.id
+         WHERE i.contract_id = ?
+         GROUP BY i.id
+         ORDER BY i.seq
+        """,
+        (contract["id"],),
+    ).fetchall()
+    overpayment = contract_overpayment_cents(conn, contract["id"])
+    return invoices, overpayment
+
+
+# ---------------------------------------------------------------------------
 # 命令处理
 # ---------------------------------------------------------------------------
 
@@ -573,6 +790,45 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--code", required=True, help="合同编号")
     p.set_defaults(handler=cmd_query_contract)
 
+    p = subparsers.add_parser(
+        "issue-invoice",
+        help="登记发票",
+        description=(
+            "为已有里程碑登记一张发票。--contract 传发票号（全局唯一），"
+            "合同由里程碑归属确定；开票日期不得早于该合同签订日期。"
+        ),
+    )
+    p.add_argument("--contract", required=True, help="发票号（全局唯一）")
+    p.add_argument("--milestone", required=True, help="所属里程碑编号（必须存在）")
+    p.add_argument("--amount", required=True, help="发票金额（元，正数，最多两位小数）")
+    p.add_argument("--date", required=True, help="开票日期（YYYY-MM-DD，不得早于合同签订日期）")
+    p.set_defaults(handler=cmd_issue_invoice)
+
+    p = subparsers.add_parser(
+        "record-payment",
+        help="登记收款",
+        description=(
+            "为已有发票登记一笔收款。收款单号全局唯一，收款日期不得早于"
+            "发票日期；累计收款超出发票金额的部分转记为合同超额收款余额。"
+        ),
+    )
+    p.add_argument("--invoice", required=True, help="发票号")
+    p.add_argument("--code", required=True, help="收款单号（全局唯一）")
+    p.add_argument("--amount", required=True, help="收款金额（元，正数，最多两位小数）")
+    p.add_argument("--date", required=True, help="收款日期（YYYY-MM-DD，不得早于发票日期）")
+    p.set_defaults(handler=cmd_record_payment)
+
+    p = subparsers.add_parser(
+        "query-payment",
+        help="查询合同的发票与收款",
+        description=(
+            "按合同编号逐行输出每张发票的发票号、里程碑编号、金额、状态、"
+            "已收金额与超收余额，末行输出合同累计超额收款余额。"
+        ),
+    )
+    p.add_argument("--contract", required=True, help="合同编号")
+    p.set_defaults(handler=cmd_query_payment)
+
     return parser
 
 
@@ -663,6 +919,47 @@ def cmd_query_contract(args: argparse.Namespace, conn: sqlite3.Connection) -> in
             )
     else:
         print("变更单：无")
+    return 0
+
+
+def cmd_issue_invoice(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:  # 单事务：失败自动回滚
+        invoice_code, milestone_code, amount_cents = issue_invoice(
+            conn, args.contract, args.milestone, args.amount, args.date
+        )
+    print(f"发票号：{invoice_code}")
+    print(f"里程碑编号：{milestone_code}")
+    print(f"金额：{format_yuan(amount_cents)}")
+    return 0
+
+
+def cmd_record_payment(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:
+        invoice = record_payment(conn, args.invoice, args.code, args.amount, args.date)
+        paid_total = invoice_paid_cents(conn, invoice["id"])
+        received = min(paid_total, int(invoice["amount_cents"]))
+    print(f"收款单号：{args.code}")
+    print(f"发票号：{invoice['code']}")
+    print(f"状态：{invoice['status']}")
+    print(f"已收金额：{format_yuan(received)}")
+    return 0
+
+
+def cmd_query_payment(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    invoices, overpayment = query_payment(conn, args.contract)
+    if invoices:
+        for inv in invoices:
+            paid_total = int(inv["paid_total_cents"])
+            received = min(paid_total, int(inv["amount_cents"]))
+            over = max(0, paid_total - int(inv["amount_cents"]))
+            print(
+                f"  - 发票号：{inv['code']}  里程碑编号：{inv['milestone_code']}  "
+                f"金额：{format_yuan(inv['amount_cents'])}  状态：{inv['status']}  "
+                f"已收金额：{format_yuan(received)}  超收余额：{format_yuan(over)}"
+            )
+    else:
+        print("发票：无")
+    print(f"累计超额收款余额：{format_yuan(overpayment)}")
     return 0
 
 
