@@ -116,6 +116,16 @@ def init_db(conn: sqlite3.Connection) -> None:
             amount_cents  INTEGER NOT NULL CHECK (amount_cents > 0),
             receipt_date  TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS receipt_items (
+            id            INTEGER PRIMARY KEY,
+            receipt_id    INTEGER NOT NULL
+                                  REFERENCES receipts(id),
+            invoice_id    INTEGER NOT NULL
+                                  REFERENCES invoices(id),
+            amount_cents  INTEGER NOT NULL CHECK (amount_cents > 0),
+            seq           INTEGER NOT NULL
+        );
         """
     )
     # 旧版本数据库可能缺少里程碑相关列，原地补齐（均不影响既有数据）。
@@ -495,12 +505,37 @@ def get_receipt(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
 
 
 def invoice_received_cents(conn: sqlite3.Connection, invoice_id: int) -> int:
-    """该发票已登记收款的合计。"""
+    """该发票已登记收款的合计。
+
+    普通收款（无分配明细）按 receipts 整笔计入；分配收款按
+    receipt_items 中属于该发票的明细计入。
+    """
     row = conn.execute(
-        "SELECT COALESCE(SUM(amount_cents), 0) FROM receipts WHERE invoice_id = ?",
+        """
+        SELECT COALESCE(SUM(amount_cents), 0)
+          FROM receipts
+         WHERE invoice_id = ?
+           AND id NOT IN (SELECT receipt_id FROM receipt_items)
+        """,
         (invoice_id,),
     ).fetchone()
-    return int(row[0])
+    allocated = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount_cents), 0)
+          FROM receipt_items
+         WHERE invoice_id = ?
+        """,
+        (invoice_id,),
+    ).fetchone()
+    return int(row[0]) + int(allocated[0])
+
+
+def receipt_items(conn: sqlite3.Connection, receipt_id: int) -> list[sqlite3.Row]:
+    """一笔收款的分配明细，按操作内输入先后排列；普通收款为空。"""
+    return conn.execute(
+        "SELECT * FROM receipt_items WHERE receipt_id = ? ORDER BY seq",
+        (receipt_id,),
+    ).fetchall()
 
 
 def register_invoice(
@@ -591,6 +626,83 @@ def register_receipt(
         """,
         (receipt_code, invoice["id"], amount_cents, receipt_date),
     )
+    return receipt_code
+
+
+def register_allocated_receipt(
+    conn: sqlite3.Connection,
+    contract_code: str,
+    receipt_code: str,
+    date_text: str,
+    items: Sequence[tuple[str, str]],
+) -> str:
+    """按合同登记一笔分配收款：一笔流水同时分配到该合同下多张发票。
+
+    items 为 (发票编号, 分配金额文本) 序列，至少一条，同一发票编号
+    至多出现一次。全部校验通过后在调用方事务内写入一条收款记录
+    （金额等于各分配金额之和）及全部分配明细；任一校验失败则整体
+    拒绝，不落任何数据。
+    """
+    contract_code = require_text(contract_code, "合同编号")
+    receipt_code = require_text(receipt_code, "收款流水号")
+    receipt_date = parse_iso_date(date_text, field="收款日期")
+    if not items:
+        raise LedgerError("至少需要一条分配项（发票编号 + 分配金额）")
+    contract = get_contract(conn, contract_code)
+    if contract is None:
+        raise LedgerError(f"引用的合同编号不存在：{contract_code}")
+    if get_receipt(conn, receipt_code) is not None:
+        raise LedgerError(f"收款流水号已存在，不得重复登记：{receipt_code}")
+    seen: set[str] = set()
+    parsed: list[tuple[sqlite3.Row, int]] = []
+    for invoice_code, amount_text in items:
+        invoice_code = require_text(invoice_code, "发票编号")
+        amount_cents = parse_amount(
+            amount_text, field="分配金额", allow_negative=False
+        )
+        if invoice_code in seen:
+            raise LedgerError(f"发票编号在同一收款中重复分配：{invoice_code}")
+        seen.add(invoice_code)
+        invoice = get_invoice(conn, invoice_code)
+        if invoice is None:
+            raise LedgerError(f"发票编号不存在：{invoice_code}")
+        if invoice["contract_id"] != contract["id"]:
+            raise LedgerError(
+                f"发票不属于该合同：发票 {invoice_code} "
+                f"不属于合同 {contract_code}"
+            )
+        if receipt_date < invoice["invoice_date"]:
+            raise LedgerError(
+                f"收款日期不得早于开票日期：{receipt_date} "
+                f"早于发票 {invoice_code} 的开票日期 {invoice['invoice_date']}"
+            )
+        received = invoice_received_cents(conn, invoice["id"])
+        if received + amount_cents > invoice["amount_cents"]:
+            raise LedgerError(
+                f"收款合计超过发票金额：发票 {invoice_code} 已收 "
+                f"{format_yuan(received)}，本次分配 {format_yuan(amount_cents)}，"
+                f"发票金额 {format_yuan(invoice['amount_cents'])}"
+            )
+        parsed.append((invoice, amount_cents))
+    total_cents = sum(amount for _, amount in parsed)
+    # receipts.invoice_id 不允许为空，分配收款登记为第一条分配项的发票；
+    # 各发票的实际已收金额一律按 receipt_items 明细计算。
+    cursor = conn.execute(
+        """
+        INSERT INTO receipts (code, invoice_id, amount_cents, receipt_date)
+        VALUES (?, ?, ?, ?)
+        """,
+        (receipt_code, parsed[0][0]["id"], total_cents, receipt_date),
+    )
+    receipt_id = cursor.lastrowid
+    for seq, (invoice, amount_cents) in enumerate(parsed, start=1):
+        conn.execute(
+            """
+            INSERT INTO receipt_items (receipt_id, invoice_id, amount_cents, seq)
+            VALUES (?, ?, ?, ?)
+            """,
+            (receipt_id, invoice["id"], amount_cents, seq),
+        )
     return receipt_code
 
 
@@ -756,6 +868,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(handler=cmd_register_receipt)
 
     p = subparsers.add_parser(
+        "allocate-receipt",
+        help="按合同登记分配收款",
+        description=(
+            "把一笔实收款同时分配到同一合同下的多张发票。收款流水号全局唯一，"
+            "收款日不得早于任一被分配发票的开票日期；每条分配项为发票编号加"
+            "分配金额（正数，最多两位小数），同一发票至多出现一次；任一发票的"
+            "累计已收金额不得超过其开票金额。全部校验通过后单事务落库，"
+            "收款金额等于各分配金额之和。"
+        ),
+    )
+    p.add_argument("--contract", required=True, help="所属合同编号")
+    p.add_argument("--code", required=True, help="收款流水号（全局唯一）")
+    p.add_argument("--date", required=True, help="收款日期（YYYY-MM-DD）")
+    p.add_argument(
+        "--alloc",
+        action="append",
+        nargs=2,
+        metavar=("发票编号", "金额"),
+        help="分配项：发票编号 + 分配金额（元）；可重复，至少一条",
+    )
+    p.set_defaults(handler=cmd_allocate_receipt)
+
+    p = subparsers.add_parser(
         "query-contract",
         aliases=["show-contract"],
         help="查询合同及其全部变更单",
@@ -841,6 +976,16 @@ def cmd_register_receipt(args: argparse.Namespace, conn: sqlite3.Connection) -> 
     return 0
 
 
+def cmd_allocate_receipt(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    items = [(pair[0], pair[1]) for pair in (args.alloc or [])]
+    with conn:  # 单事务：失败自动回滚
+        code = register_allocated_receipt(
+            conn, args.contract, args.code, args.date, items
+        )
+    print(f"收款流水号：{code}")
+    return 0
+
+
 def cmd_query_contract(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     contract, changes, milestones, invoices, receipts = query_contract(
         conn, args.code
@@ -893,10 +1038,20 @@ def cmd_query_contract(args: argparse.Namespace, conn: sqlite3.Connection) -> in
         invoice_codes = {inv["id"]: inv["code"] for inv in invoices}
         print("收款：")
         for rc in receipts:
+            items = receipt_items(conn, rc["id"])
+            if items:
+                detail = " ".join(
+                    f"{invoice_codes[it['invoice_id']]} "
+                    f"{format_yuan(it['amount_cents'])}"
+                    for it in items
+                )
+                allocation = f"分配：{detail}"
+            else:
+                allocation = f"分配：整笔归 {invoice_codes[rc['invoice_id']]}"
             print(
                 f"  - {rc['code']}  发票：{invoice_codes[rc['invoice_id']]}  "
                 f"金额：{format_yuan(rc['amount_cents'])}  "
-                f"收款日：{rc['receipt_date']}"
+                f"收款日：{rc['receipt_date']}  {allocation}"
             )
     else:
         print("收款：无")
