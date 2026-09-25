@@ -29,11 +29,19 @@ _AMOUNT_RE = re.compile(r"^-?\d+(?:\.\d{1,2})?$")
 #: 变更单状态。
 DRAFT = "draft"
 EFFECTIVE = "effective"
+#: 变更单与发票共用的“已作废”状态值。
 VOID = "void"
+#: 发票已开具状态。
+ISSUED = "issued"
 
 STATUS_LABELS = {
     DRAFT: "草稿",
     EFFECTIVE: "已生效",
+    VOID: "已作废",
+}
+
+INVOICE_STATUS_LABELS = {
+    ISSUED: "已开具",
     VOID: "已作废",
 }
 
@@ -95,6 +103,20 @@ def init_db(conn: sqlite3.Connection) -> None:
                                   CHECK (status IN ('draft', 'effective', 'void')),
             effective_date TEXT,
             seq           INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS invoices (
+            id           INTEGER PRIMARY KEY,
+            number       TEXT NOT NULL UNIQUE,
+            contract_id  INTEGER NOT NULL
+                                 REFERENCES contracts(id),
+            milestone_id INTEGER
+                                 REFERENCES milestones(id),
+            amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+            issued_date  TEXT NOT NULL,
+            status       TEXT NOT NULL
+                                 CHECK (status IN ('issued', 'void')),
+            seq          INTEGER NOT NULL
         );
         """
     )
@@ -477,6 +499,135 @@ def query_contract(
     return contract, changes, milestones
 
 
+def get_invoice(conn: sqlite3.Connection, number: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM invoices WHERE number = ?", (number,)
+    ).fetchone()
+
+
+def list_invoices(
+    conn: sqlite3.Connection, contract_id: int
+) -> list[sqlite3.Row]:
+    """合同下全部发票，按登记先后排列。"""
+    return conn.execute(
+        "SELECT * FROM invoices WHERE contract_id = ? ORDER BY seq",
+        (contract_id,),
+    ).fetchall()
+
+
+def register_invoice(
+    conn: sqlite3.Connection,
+    contract_code: str,
+    number: str,
+    amount_text: str,
+    issued_text: str,
+    milestone_code: str | None = None,
+) -> str:
+    contract_code = require_text(contract_code, "合同编号")
+    number = require_text(number, "发票号")
+    amount_cents = parse_amount(
+        amount_text, field="发票金额", allow_negative=False
+    )
+    issued_date = parse_iso_date(issued_text, field="开票日期")
+    contract = get_contract(conn, contract_code)
+    if contract is None:
+        raise LedgerError(f"引用的合同编号不存在：{contract_code}")
+    if get_invoice(conn, number) is not None:
+        raise LedgerError(f"发票号已存在，不得重复登记：{number}")
+    if issued_date < contract["signed_date"]:
+        raise LedgerError(
+            f"开票日期不得早于合同签订日期：{issued_date} 早于 "
+            f"{contract['signed_date']}"
+        )
+    milestone_id = None
+    if milestone_code is not None:
+        milestone_code = require_text(milestone_code, "里程碑编号")
+        milestone = get_milestone(conn, milestone_code)
+        if milestone is None:
+            raise LedgerError(f"里程碑编号不存在：{milestone_code}")
+        if milestone["contract_id"] != contract["id"]:
+            raise LedgerError(
+                f"里程碑不属于该合同：里程碑 {milestone_code} "
+                f"不属于合同 {contract_code}"
+            )
+        milestone_id = milestone["id"]
+    next_seq = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM invoices WHERE contract_id = ?",
+        (contract["id"],),
+    ).fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO invoices
+            (number, contract_id, milestone_id, amount_cents,
+             issued_date, status, seq)
+        VALUES (?, ?, ?, ?, ?, 'issued', ?)
+        """,
+        (number, contract["id"], milestone_id, amount_cents,
+         issued_date, next_seq),
+    )
+    return number
+
+
+def void_invoice(conn: sqlite3.Connection, number: str) -> str:
+    number = require_text(number, "发票号")
+    invoice = get_invoice(conn, number)
+    if invoice is None:
+        raise LedgerError(f"发票号不存在：{number}")
+    if invoice["status"] == VOID:
+        raise LedgerError(f"发票已作废，不能重复作废：{number}")
+    conn.execute(
+        "UPDATE invoices SET status = 'void' WHERE id = ?",
+        (invoice["id"],),
+    )
+    return number
+
+
+def milestone_invoiced_cents(
+    conn: sqlite3.Connection, milestone_id: int
+) -> int:
+    """该里程碑下「已开具」发票金额合计（不作废、不截断）。"""
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount_cents), 0)
+          FROM invoices
+         WHERE milestone_id = ?
+           AND status = 'issued'
+        """,
+        (milestone_id,),
+    ).fetchone()
+    return int(row[0])
+
+
+def overdue_uninvoiced(
+    conn: sqlite3.Connection, contract_id: int, as_of: str
+) -> list[tuple[sqlite3.Row, int]]:
+    """截止日当天仍逾期未开票的里程碑。
+
+    差额 = 里程碑当前金额 - 该里程碑下已开具发票合计；差额大于零且
+    截止日不早于到期日即为逾期。按到期日升序、同到期日按登记先后。
+    """
+    result = []
+    for ms in list_milestones(conn, contract_id):
+        gap = milestone_current_cents(conn, ms["id"]) - milestone_invoiced_cents(
+            conn, ms["id"]
+        )
+        if gap > 0 and as_of >= ms["due_date"]:
+            result.append((ms, gap))
+    result.sort(key=lambda item: (item[0]["due_date"], item[0]["seq"]))
+    return result
+
+
+def reconcile(
+    conn: sqlite3.Connection, contract_code: str, as_of_text: str
+) -> tuple[list[tuple[sqlite3.Row, int]], str]:
+    contract_code = require_text(contract_code, "合同编号")
+    as_of = parse_iso_date(as_of_text, field="截止日")
+    contract = get_contract(conn, contract_code)
+    if contract is None:
+        raise LedgerError(f"合同编号不存在：{contract_code}")
+    return overdue_uninvoiced(conn, contract["id"], as_of), as_of
+
+
 # ---------------------------------------------------------------------------
 # 命令处理
 # ---------------------------------------------------------------------------
@@ -568,10 +719,49 @@ def build_parser() -> argparse.ArgumentParser:
         "query-contract",
         aliases=["show-contract"],
         help="查询合同及其全部变更单",
-        description="按合同编号输出合同信息与全部变更单（按登记先后排列），不改动数据。",
+        description="按合同编号输出合同信息、变更单与开票记录（均按登记先后排列），不改动数据。",
     )
     p.add_argument("--code", required=True, help="合同编号")
     p.set_defaults(handler=cmd_query_contract)
+
+    p = subparsers.add_parser(
+        "register-invoice",
+        help="登记发票",
+        description=(
+            "为已有合同登记一张已开具发票。发票号全局唯一，金额为正数，"
+            "开票日期不得早于合同签订日期；可用 --milestone 归属到该合同"
+            "下的里程碑，省略则归属整份合同。"
+        ),
+    )
+    p.add_argument("--contract", required=True, help="所属合同编号")
+    p.add_argument("--number", required=True, help="发票号（全局唯一）")
+    p.add_argument("--amount", required=True, help="发票金额（元，正数，最多两位小数）")
+    p.add_argument("--date", required=True, help="开票日期（YYYY-MM-DD，不得早于合同签订日期）")
+    p.add_argument(
+        "--milestone",
+        help="归属里程碑编号（省略则归属整份合同；指定时必须属于该合同）",
+    )
+    p.set_defaults(handler=cmd_register_invoice)
+
+    p = subparsers.add_parser(
+        "void-invoice",
+        help="作废发票",
+        description="把已开具发票置为已作废；已作废发票不得再次作废。",
+    )
+    p.add_argument("--number", required=True, help="发票号")
+    p.set_defaults(handler=cmd_void_invoice)
+
+    p = subparsers.add_parser(
+        "reconcile",
+        help="对账：输出逾期未开票里程碑",
+        description=(
+            "按截止日对账，逐行输出差额大于零且已到期的里程碑"
+            "（按到期日升序、同到期日按登记先后），不改动数据。"
+        ),
+    )
+    p.add_argument("--contract", required=True, help="合同编号")
+    p.add_argument("--as-of", required=True, help="截止日（YYYY-MM-DD）")
+    p.set_defaults(handler=cmd_reconcile)
 
     return parser
 
@@ -631,6 +821,34 @@ def cmd_void_change(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     return 0
 
 
+def cmd_register_invoice(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:  # 单事务：失败自动回滚
+        number = register_invoice(
+            conn, args.contract, args.number, args.amount, args.date,
+            milestone_code=args.milestone,
+        )
+    print(f"发票号：{number}")
+    print("状态：已开具")
+    return 0
+
+
+def cmd_void_invoice(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:
+        number = void_invoice(conn, args.number)
+    print(f"发票号：{number}")
+    return 0
+
+
+def cmd_reconcile(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    overdue, _as_of = reconcile(conn, args.contract, args.as_of)
+    if overdue:
+        for ms, gap in overdue:
+            print(f"{ms['code']} {ms['due_date']} {format_yuan(gap)}")
+    else:
+        print("逾期未开票：无")
+    return 0
+
+
 def cmd_query_contract(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     contract, changes, milestones = query_contract(conn, args.code)
     amount = current_cents(conn, contract["id"])
@@ -663,6 +881,17 @@ def cmd_query_contract(args: argparse.Namespace, conn: sqlite3.Connection) -> in
             )
     else:
         print("变更单：无")
+    invoices = list_invoices(conn, contract["id"])
+    if invoices:
+        print("开票记录：")
+        for inv in invoices:
+            print(
+                f"  - {inv['number']}  开票日期：{inv['issued_date']}  "
+                f"金额：{format_yuan(inv['amount_cents'])}  "
+                f"状态：{INVOICE_STATUS_LABELS[inv['status']]}"
+            )
+    else:
+        print("开票记录：无")
     return 0
 
 
