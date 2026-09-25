@@ -55,6 +55,14 @@ class CLIHarness:
             "--description", description, "--delta", delta,
         )
 
+    def register_milestone(self, contract="C001", code="M01", title="首付款",
+                           amount="3000", due="2026-03-01"):
+        return self.invoke(
+            "register-milestone",
+            "--contract", contract, "--code", code,
+            "--title", title, "--amount", amount, "--due", due,
+        )
+
     def query(self, code="C001"):
         return self.invoke("query-contract", "--code", code)
 
@@ -367,6 +375,231 @@ class LifecyclePersistenceTests(unittest.TestCase):
         self.assertIn("当前金额：800", result.stdout)
         self.assertIn("已作废", result.stdout)
         self.assertIn("已生效", result.stdout)
+
+
+class MilestoneRegistrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cli = CLIHarness()
+        self.addCleanup(self.cli.cleanup)
+        self.assertEqual(self.cli.register_contract(amount="10000").returncode, 0)
+
+    def test_register_success_is_pending_and_lists_in_query(self) -> None:
+        result = self.cli.register_milestone(code="M1", amount="3000.50")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("M1", result.stdout)
+        self.assertIn("3000.5", result.stdout)
+        query = self.cli.query()
+        self.assertIn("里程碑：", query.stdout)
+        self.assertIn("M1", query.stdout)
+        self.assertIn("待确认", query.stdout)
+        # 待确认不计入已确认金额。
+        self.assertIn("已确认金额：0", query.stdout)
+
+    def test_multiple_milestones_listed_in_registration_order(self) -> None:
+        self.cli.register_milestone(code="M3", due="2026-03-01")
+        self.cli.register_milestone(code="M1", due="2026-04-01")
+        self.cli.register_milestone(code="M2", due="2026-05-01")
+        out = self.cli.query().stdout
+        self.assertLess(out.index("- M3"), out.index("- M1"))
+        self.assertLess(out.index("- M1"), out.index("- M2"))
+
+    def test_register_on_nonexistent_contract_fails(self) -> None:
+        result = self.cli.register_milestone(contract="NOPE", code="X1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不存在", result.stderr)
+
+    def test_duplicate_code_fails_globally(self) -> None:
+        self.assertEqual(self.cli.register_milestone(code="DUP").returncode, 0)
+        self.cli.register_contract(code="C002", customer="乙", amount="100")
+        result = self.cli.register_milestone(contract="C002", code="DUP")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("DUP", result.stderr)
+        # 第二份合同没有留下任何里程碑。
+        self.assertIn("里程碑：无", self.cli.query("C002").stdout)
+
+    def test_blank_title_rejected(self) -> None:
+        result = self.cli.register_milestone(code="B1", title="   ")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("里程碑标题", result.stderr)
+
+    def test_invalid_amounts_fail(self) -> None:
+        for bad in ["0", "-1", "1.234", "abc", "", " 100"]:
+            with self.subTest(bad=bad):
+                result = self.cli.register_milestone(code=f"A-{bad or 'e'}", amount=bad)
+                self.assertNotEqual(result.returncode, 0, f"应当拒绝 {bad!r}")
+                self.assertIn("金额", result.stderr)
+
+    def test_invalid_due_date_fails(self) -> None:
+        for bad in ["2026-13-01", "2026-02-30", "2026/03/01", "20260301", "2026-3-1"]:
+            with self.subTest(bad=bad):
+                result = self.cli.register_milestone(code=f"D-{bad}", due=bad)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("到期日", result.stderr)
+
+    def test_failed_registration_changes_nothing(self) -> None:
+        # 非法日期失败后，合同仍无里程碑。
+        bad = self.cli.register_milestone(code="G1", due="2026-02-30")
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertIn("里程碑：无", self.cli.query().stdout)
+
+
+class MilestoneScalingTests(unittest.TestCase):
+    """里程碑当前金额随合同变更联动缩放。"""
+
+    def setUp(self) -> None:
+        self.cli = CLIHarness()
+        self.addCleanup(self.cli.cleanup)
+        # 初始 3 元，便于验证向下取整到分。
+        self.assertEqual(
+            self.cli.register_contract(code="C001", amount="3").returncode, 0
+        )
+        self.cli.register_milestone(code="MA", amount="1", due="2026-02-01")
+        self.cli.register_milestone(code="MB", amount="2", due="2026-03-01")
+        self.assertEqual(self.cli.invoke("confirm-milestone", "--code", "MA").returncode, 0)
+
+    def change(self, code, delta, *, effect=True):
+        self.assertEqual(
+            self.cli.register_change(code=code, delta=delta).returncode, 0
+        )
+        if effect:
+            self.assertEqual(
+                self.cli.invoke("effect-change", "--code", code).returncode, 0
+            )
+
+    def test_scale_down_floors_to_cent(self) -> None:
+        # 3 -> 2：MA = 100*200//300 = 66 分 = 0.66；
+        # MB = 200*200//300 = 133 分 = 1.33。
+        self.change("D1", "-1")
+        out = self.cli.query().stdout
+        self.assertIn("当前金额：0.66", out)
+        self.assertIn("当前金额：1.33", out)
+        # 只有已确认的 MA 计入。
+        self.assertIn("已确认金额：0.66", out)
+
+    def test_scale_up(self) -> None:
+        # 3 -> 6：MA = 2，MB = 4。
+        self.change("D1", "3")
+        out = self.cli.query().stdout
+        self.assertIn("当前金额：2", out)
+        self.assertIn("当前金额：4", out)
+        self.assertIn("已确认金额：2", out)
+
+    def test_voiding_effective_change_restores_amounts(self) -> None:
+        self.change("D1", "-1")
+        self.assertEqual(self.cli.invoke("void-change", "--code", "D1").returncode, 0)
+        out = self.cli.query().stdout
+        # 回到 3：MA = 1，MB = 2。
+        self.assertIn("当前金额：1", out)
+        self.assertIn("当前金额：2", out)
+        self.assertIn("已确认金额：1", out)
+
+    def test_draft_change_does_not_scale(self) -> None:
+        # 草稿不影响合同当前金额，里程碑金额不变。
+        self.change("D1", "999", effect=False)
+        out = self.cli.query().stdout
+        self.assertIn("当前金额：1", out)
+        self.assertIn("当前金额：2", out)
+
+    def test_query_milestone_reflects_scaled_amount(self) -> None:
+        self.change("D1", "3")  # 3 -> 6
+        result = self.cli.invoke("query-milestone", "--code", "MA")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("所属合同编号：C001", result.stdout)
+        self.assertIn("登记金额：1", result.stdout)
+        self.assertIn("当前金额：2", result.stdout)
+        self.assertIn("到期日：2026-02-01", result.stdout)
+        self.assertIn("已确认", result.stdout)
+
+
+class MilestoneLifecycleTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cli = CLIHarness()
+        self.addCleanup(self.cli.cleanup)
+        self.assertEqual(self.cli.register_contract(amount="100").returncode, 0)
+        self.cli.register_milestone(code="M1", amount="40", due="2026-02-01")
+        self.cli.register_milestone(code="M2", amount="60", due="2026-03-01")
+
+    def test_confirm_then_cancel_flow_and_confirmed_total(self) -> None:
+        self.assertEqual(
+            self.cli.invoke("confirm-milestone", "--code", "M1").returncode, 0
+        )
+        out = self.cli.query().stdout
+        self.assertIn("已确认金额：40", out)
+        # 第二个确认后累加。
+        self.assertEqual(
+            self.cli.invoke("confirm-milestone", "--code", "M2").returncode, 0
+        )
+        self.assertIn("已确认金额：100", self.cli.query().stdout)
+        # 作废 M1 后只剩 M2。
+        self.assertEqual(
+            self.cli.invoke("cancel-milestone", "--code", "M1").returncode, 0
+        )
+        self.assertIn("已确认金额：60", self.cli.query().stdout)
+        self.assertIn("已作废", self.cli.query().stdout)
+
+    def test_pending_can_cancel_directly(self) -> None:
+        result = self.cli.invoke("cancel-milestone", "--code", "M1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("已作废", self.cli.query().stdout)
+        # 已作废不计入已确认金额。
+        self.assertIn("已确认金额：0", self.cli.query().stdout)
+
+    def test_cannot_confirm_twice(self) -> None:
+        self.cli.invoke("confirm-milestone", "--code", "M1")
+        again = self.cli.invoke("confirm-milestone", "--code", "M1")
+        self.assertNotEqual(again.returncode, 0)
+        self.assertIn("已确认", again.stderr)
+
+    def test_canceled_is_terminal(self) -> None:
+        self.cli.invoke("cancel-milestone", "--code", "M1")
+        confirm = self.cli.invoke("confirm-milestone", "--code", "M1")
+        self.assertNotEqual(confirm.returncode, 0)
+        self.assertIn("作废", confirm.stderr)
+        cancel = self.cli.invoke("cancel-milestone", "--code", "M1")
+        self.assertNotEqual(cancel.returncode, 0)
+        self.assertIn("作废", cancel.stderr)
+
+    def test_confirm_unknown_milestone_fails(self) -> None:
+        result = self.cli.invoke("confirm-milestone", "--code", "GHOST")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不存在", result.stderr)
+
+    def test_cancel_unknown_milestone_fails(self) -> None:
+        result = self.cli.invoke("cancel-milestone", "--code", "GHOST")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不存在", result.stderr)
+
+    def test_query_unknown_milestone_fails_nonzero_stderr(self) -> None:
+        result = self.cli.invoke("query-milestone", "--code", "GHOST")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("不存在", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_failed_transition_changes_nothing(self) -> None:
+        self.cli.invoke("confirm-milestone", "--code", "M1")
+        # 重复确认失败：M1 仍为已确认，M2 仍为待确认，已确认金额仍为 40。
+        bad = self.cli.invoke("confirm-milestone", "--code", "M1")
+        self.assertNotEqual(bad.returncode, 0)
+        out = self.cli.query().stdout
+        self.assertIn("M1", out)
+        self.assertIn("M2", out)
+        self.assertIn("待确认", out)
+        self.assertIn("已确认金额：40", out)
+        # M1 行仍为已确认（该行不含"已确认金额"前缀）。
+        m1_line = next(line for line in out.splitlines() if "- M1" in line)
+        self.assertIn("状态：已确认", m1_line)
+
+
+class MilestoneQueryOutputTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.cli = CLIHarness()
+        self.addCleanup(self.cli.cleanup)
+
+    def test_no_milestones_shows_none_and_zero_confirmed(self) -> None:
+        self.cli.register_contract(amount="100")
+        out = self.cli.query().stdout
+        self.assertIn("里程碑：无", out)
+        self.assertIn("已确认金额：0", out)
 
 
 if __name__ == "__main__":
