@@ -133,7 +133,11 @@ class MilestoneRegistrationTests(unittest.TestCase):
     def test_no_milestone_section_shows_none_and_zero_confirmed(self) -> None:
         query = self.cli.query_contract()
         self.assertIn("里程碑：无", query.stdout)
-        self.assertTrue(query.stdout.rstrip().endswith("已确认金额：0"))
+        self.assertIn("已确认金额：0", query.stdout)
+        # 开票/收款段紧随其后，无记录时各合计均为 0。
+        self.assertIn("开票：无", query.stdout)
+        self.assertIn("收款：无", query.stdout)
+        self.assertTrue(query.stdout.rstrip().endswith("未匹配差额：0.00"))
 
 
 class MilestoneAmountLinkageTests(unittest.TestCase):

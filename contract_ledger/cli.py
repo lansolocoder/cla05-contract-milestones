@@ -99,6 +99,26 @@ def init_db(conn: sqlite3.Connection) -> None:
                                     CHECK (status IN ('pending', 'confirmed', 'voided')),
             seq             INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS invoices (
+            id           INTEGER PRIMARY KEY,
+            code         TEXT NOT NULL UNIQUE,
+            milestone_id INTEGER NOT NULL
+                                 REFERENCES milestones(id),
+            amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+            issued_date  TEXT NOT NULL,
+            seq          INTEGER NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS payments (
+            id           INTEGER PRIMARY KEY,
+            code         TEXT NOT NULL UNIQUE,
+            amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+            paid_date    TEXT NOT NULL,
+            invoice_id   INTEGER REFERENCES invoices(id),
+            contract_id  INTEGER REFERENCES contracts(id),
+            seq          INTEGER NOT NULL
+        );
         """
     )
     conn.commit()
@@ -164,6 +184,14 @@ def format_yuan(cents: int) -> str:
     yuan, rem = divmod(cents, 100)
     if rem == 0:
         return f"{sign}{yuan}"
+    return f"{sign}{yuan}.{rem:02d}"
+
+
+def format_yuan2(cents: int) -> str:
+    """把整数分格式化为元，固定两位小数（开票/收款输出统一使用）。"""
+    sign = "-" if cents < 0 else ""
+    cents = abs(cents)
+    yuan, rem = divmod(cents, 100)
     return f"{sign}{yuan}.{rem:02d}"
 
 
@@ -441,6 +469,193 @@ def query_milestone(conn: sqlite3.Connection, code: str) -> sqlite3.Row:
 
 
 # ---------------------------------------------------------------------------
+# 开票与收款操作
+# ---------------------------------------------------------------------------
+
+def get_invoice(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM invoices WHERE code = ?", (code,)
+    ).fetchone()
+
+
+def get_payment(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM payments WHERE code = ?", (code,)
+    ).fetchone()
+
+
+def invoice_status_label(paid_cents: int, invoice_cents: int) -> str:
+    """发票状态：已收款为零 / 部分 / 收齐（大于等于发票金额）。"""
+    if paid_cents <= 0:
+        return "已开票"
+    if paid_cents >= invoice_cents:
+        return "已收齐"
+    return "部分收款"
+
+
+def invoice_paid_cents(conn: sqlite3.Connection, invoice_id: int) -> int:
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE invoice_id = ?",
+        (invoice_id,),
+    ).fetchone()
+    return int(row[0])
+
+
+def list_invoice_payments(
+    conn: sqlite3.Connection, invoice_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM payments WHERE invoice_id = ? ORDER BY seq",
+        (invoice_id,),
+    ).fetchall()
+
+
+def register_invoice(
+    conn: sqlite3.Connection,
+    milestone_code: str,
+    invoice_code: str,
+    amount_text: str,
+    date_text: str | None,
+) -> tuple[str, int, str]:
+    milestone_code = require_text(milestone_code, "里程碑编号")
+    invoice_code = require_text(invoice_code, "发票编号")
+    amount_cents = parse_amount(
+        amount_text, field="发票金额", allow_negative=False
+    )
+    issued_date = (
+        parse_iso_date(date_text, field="开票日期")
+        if date_text is not None
+        else date.today().isoformat()
+    )
+    milestone = get_milestone(conn, milestone_code)
+    if milestone is None:
+        raise LedgerError(f"引用的里程碑编号不存在：{milestone_code}")
+    if milestone["status"] != M_CONFIRMED:
+        raise LedgerError(
+            f"只能为已确认里程碑登记发票，里程碑当前状态为"
+            f"{STATUS_LABELS[milestone['status']]}：{milestone_code}"
+        )
+    if get_invoice(conn, invoice_code) is not None:
+        raise LedgerError(f"发票编号已存在，不得重复登记：{invoice_code}")
+    next_seq = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM invoices"
+    ).fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO invoices (code, milestone_id, amount_cents, issued_date, seq)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (invoice_code, milestone["id"], amount_cents, issued_date, next_seq),
+    )
+    return invoice_code, amount_cents, issued_date
+
+
+def register_payment(
+    conn: sqlite3.Connection,
+    payment_code: str,
+    invoice_code: str | None,
+    contract_code: str | None,
+    amount_text: str,
+    date_text: str | None,
+) -> tuple[sqlite3.Row, bool]:
+    """登记收款；返回（既有或新建收款行, 是否为重复请求）。
+
+    同一收款编号重复登记视为重复请求：不产生第二笔记录，由调用方
+    输出与首次相同的成功信息。
+    """
+    payment_code = require_text(payment_code, "收款编号")
+
+    # 重复请求优先短路：编号已存在即返回既有记录，与本次其余参数无关。
+    existing = get_payment(conn, payment_code)
+    if existing is not None:
+        return existing, True
+
+    if invoice_code is not None and contract_code is not None:
+        raise LedgerError("收款只能按发票或按合同匹配，不得同时指定 --invoice 与 --contract")
+    if invoice_code is None and contract_code is None:
+        raise LedgerError("收款必须指定匹配目标：--invoice 或 --contract（二选一）")
+    amount_cents = parse_amount(
+        amount_text, field="收款金额", allow_negative=False
+    )
+    paid_date = (
+        parse_iso_date(date_text, field="收款日期")
+        if date_text is not None
+        else date.today().isoformat()
+    )
+
+    if invoice_code is not None:
+        invoice_code = require_text(invoice_code, "发票编号")
+        invoice = get_invoice(conn, invoice_code)
+        if invoice is None:
+            raise LedgerError(f"引用的发票编号不存在：{invoice_code}")
+        already = invoice_paid_cents(conn, invoice["id"])
+        if already + amount_cents > invoice["amount_cents"]:
+            raise LedgerError(
+                f"收款将超过发票金额（发票 {format_yuan2(invoice['amount_cents'])}，"
+                f"已收 {format_yuan2(already)}，本次 {format_yuan2(amount_cents)}），"
+                f"整笔拒绝：{invoice_code}"
+            )
+        invoice_id, contract_id = invoice["id"], None
+    else:
+        contract_code = require_text(contract_code, "合同编号")
+        contract = get_contract(conn, contract_code)
+        if contract is None:
+            raise LedgerError(f"引用的合同编号不存在：{contract_code}")
+        invoice_id, contract_id = None, contract["id"]
+
+    next_seq = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM payments"
+    ).fetchone()[0]
+    cur = conn.execute(
+        """
+        INSERT INTO payments
+            (code, amount_cents, paid_date, invoice_id, contract_id, seq)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (payment_code, amount_cents, paid_date, invoice_id, contract_id, next_seq),
+    )
+    row = conn.execute(
+        "SELECT * FROM payments WHERE id = ?", (cur.lastrowid,)
+    ).fetchone()
+    return row, False
+
+
+def payment_target(conn: sqlite3.Connection, payment: sqlite3.Row) -> str:
+    """收款匹配目标：发票编号，或“合同：合同编号”。"""
+    if payment["invoice_id"] is not None:
+        row = conn.execute(
+            "SELECT code FROM invoices WHERE id = ?", (payment["invoice_id"],)
+        ).fetchone()
+        return row["code"]
+    row = conn.execute(
+        "SELECT code FROM contracts WHERE id = ?", (payment["contract_id"],)
+    ).fetchone()
+    return f"合同：{row['code']}"
+
+
+def query_invoice(
+    conn: sqlite3.Connection, code: str
+) -> tuple[sqlite3.Row, sqlite3.Row, list[sqlite3.Row]]:
+    code = require_text(code, "发票编号")
+    invoice = get_invoice(conn, code)
+    if invoice is None:
+        raise LedgerError(f"发票编号不存在：{code}")
+    milestone = conn.execute(
+        "SELECT * FROM milestones WHERE id = ?", (invoice["milestone_id"],)
+    ).fetchone()
+    payments = list_invoice_payments(conn, invoice["id"])
+    return invoice, milestone, payments
+
+
+def query_payment(conn: sqlite3.Connection, code: str) -> sqlite3.Row:
+    code = require_text(code, "收款编号")
+    payment = get_payment(conn, code)
+    if payment is None:
+        raise LedgerError(f"收款编号不存在：{code}")
+    return payment
+
+
+# ---------------------------------------------------------------------------
 # 命令处理
 # ---------------------------------------------------------------------------
 
@@ -539,6 +754,52 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--code", required=True, help="里程碑编号")
     p.set_defaults(handler=cmd_query_milestone)
 
+    p = subparsers.add_parser(
+        "register-invoice",
+        aliases=["add-invoice"],
+        help="为已确认里程碑登记发票",
+        description="只能为已确认里程碑登记发票；发票编号全局唯一，缺省日期按登记当天记账。",
+    )
+    p.add_argument("--milestone", required=True, help="所属里程碑编号（须为已确认）")
+    p.add_argument("--code", required=True, help="发票编号（全局唯一）")
+    p.add_argument("--amount", required=True, help="发票金额（元，正数，最多两位小数）")
+    p.add_argument("--date", help="开票日期（YYYY-MM-DD），缺省为登记当天")
+    p.set_defaults(handler=cmd_register_invoice)
+
+    p = subparsers.add_parser(
+        "register-payment",
+        aliases=["add-payment"],
+        help="登记收款（按发票或按合同匹配）",
+        description=(
+            "按发票或按合同二选一匹配收款，同时给出两者视为非法输入；"
+            "同一发票收款累计不得超过发票金额；编号重复视为重复请求。"
+        ),
+    )
+    p.add_argument("--code", required=True, help="收款编号（全局唯一）")
+    p.add_argument("--invoice", help="匹配的发票编号（与 --contract 二选一）")
+    p.add_argument("--contract", help="匹配的合同编号（与 --invoice 二选一）")
+    p.add_argument("--amount", required=True, help="收款金额（元，正数，最多两位小数）")
+    p.add_argument("--date", help="收款日期（YYYY-MM-DD），缺省为登记当天")
+    p.set_defaults(handler=cmd_register_payment)
+
+    p = subparsers.add_parser(
+        "query-invoice",
+        aliases=["show-invoice"],
+        help="查询单张发票及其收款明细",
+        description="输出发票所属里程碑、金额、日期、状态及全部收款明细，不改动数据。",
+    )
+    p.add_argument("--code", required=True, help="发票编号")
+    p.set_defaults(handler=cmd_query_invoice)
+
+    p = subparsers.add_parser(
+        "query-payment",
+        aliases=["show-payment"],
+        help="查询单笔收款",
+        description="输出收款金额、日期与匹配目标（发票编号或合同编号），不改动数据。",
+    )
+    p.add_argument("--code", required=True, help="收款编号")
+    p.set_defaults(handler=cmd_query_payment)
+
     return parser
 
 
@@ -611,6 +872,56 @@ def cmd_query_contract(args: argparse.Namespace, conn: sqlite3.Connection) -> in
     else:
         print("里程碑：无")
     print(f"已确认金额：{format_yuan(confirmed_cents(conn, contract['id']))}")
+
+    invoices = conn.execute(
+        """
+        SELECT i.* FROM invoices AS i
+          JOIN milestones AS m ON i.milestone_id = m.id
+         WHERE m.contract_id = ?
+         ORDER BY i.seq
+        """,
+        (contract["id"],),
+    ).fetchall()
+    if invoices:
+        print("开票：")
+        for inv in invoices:
+            milestone = conn.execute(
+                "SELECT code FROM milestones WHERE id = ?", (inv["milestone_id"],)
+            ).fetchone()
+            paid = invoice_paid_cents(conn, inv["id"])
+            print(
+                f"  - {inv['code']}  里程碑编号：{milestone['code']}  "
+                f"金额：{format_yuan2(inv['amount_cents'])}  "
+                f"状态：{invoice_status_label(paid, inv['amount_cents'])}"
+            )
+    else:
+        print("开票：无")
+
+    payments = conn.execute(
+        """
+        SELECT p.* FROM payments AS p
+          LEFT JOIN invoices AS i ON p.invoice_id = i.id
+          LEFT JOIN milestones AS m ON i.milestone_id = m.id
+         WHERE p.contract_id = ? OR m.contract_id = ?
+         ORDER BY p.seq
+        """,
+        (contract["id"], contract["id"]),
+    ).fetchall()
+    if payments:
+        print("收款：")
+        for pay in payments:
+            print(
+                f"  - {pay['code']}  金额：{format_yuan2(pay['amount_cents'])}  "
+                f"匹配目标：{payment_target(conn, pay)}"
+            )
+    else:
+        print("收款：无")
+
+    invoice_total = sum(int(inv["amount_cents"]) for inv in invoices)
+    payment_total = sum(int(pay["amount_cents"]) for pay in payments)
+    print(f"开票合计：{format_yuan2(invoice_total)}")
+    print(f"收款合计：{format_yuan2(payment_total)}")
+    print(f"未匹配差额：{format_yuan2(invoice_total - payment_total)}")
     return 0
 
 
@@ -653,6 +964,62 @@ def cmd_query_milestone(args: argparse.Namespace, conn: sqlite3.Connection) -> i
     print(f"当前金额：{format_yuan(current)}")
     print(f"到期日：{milestone['due_date']}")
     print(f"状态：{STATUS_LABELS[milestone['status']]}")
+    return 0
+
+
+def cmd_register_invoice(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:  # 单事务：失败自动回滚
+        code, amount_cents, issued_date = register_invoice(
+            conn, args.milestone, args.code, args.amount, args.date
+        )
+    print(f"发票已登记：{code}")
+    print(f"金额：{format_yuan2(amount_cents)}")
+    print(f"日期：{issued_date}")
+    return 0
+
+
+def cmd_register_payment(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:
+        payment, _duplicate = register_payment(
+            conn, args.code, args.invoice, args.contract, args.amount, args.date
+        )
+        target = payment_target(conn, payment)
+        amount_cents = int(payment["amount_cents"])
+        paid_date = payment["paid_date"]
+    # 重复请求返回与首次相同的成功输出（由相同记录生成，内容天然一致）。
+    print(f"收款已登记：{payment['code']}")
+    print(f"金额：{format_yuan2(amount_cents)}")
+    print(f"日期：{paid_date}")
+    print(f"匹配目标：{target}")
+    return 0
+
+
+def cmd_query_invoice(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    invoice, milestone, payments = query_invoice(conn, args.code)
+    paid = invoice_paid_cents(conn, invoice["id"])
+    print(f"发票编号：{invoice['code']}")
+    print(f"里程碑编号：{milestone['code']}")
+    print(f"金额：{format_yuan2(invoice['amount_cents'])}")
+    print(f"日期：{invoice['issued_date']}")
+    print(f"状态：{invoice_status_label(paid, int(invoice['amount_cents']))}")
+    if payments:
+        print("收款明细：")
+        for pay in payments:
+            print(
+                f"  - {pay['code']}  金额：{format_yuan2(pay['amount_cents'])}  "
+                f"日期：{pay['paid_date']}"
+            )
+    else:
+        print("收款明细：无")
+    return 0
+
+
+def cmd_query_payment(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    payment = query_payment(conn, args.code)
+    print(f"收款编号：{payment['code']}")
+    print(f"金额：{format_yuan2(payment['amount_cents'])}")
+    print(f"日期：{payment['paid_date']}")
+    print(f"匹配目标：{payment_target(conn, payment)}")
     return 0
 
 
