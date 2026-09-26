@@ -10,6 +10,7 @@ import argparse
 from collections.abc import Sequence
 from datetime import date
 from pathlib import Path
+import json
 import os
 import re
 import sqlite3
@@ -200,6 +201,13 @@ def format_yuan(cents: int) -> str:
     if rem == 0:
         return f"{sign}{yuan}"
     return f"{sign}{yuan}.{rem:02d}"
+
+
+def yuan_number(cents: int) -> int | float:
+    """把整数分转为元的 JSON 数字（整元为 int，含角分时为两位小数 float）。"""
+    yuan, rem = divmod(abs(cents), 100)
+    value: int | float = yuan if rem == 0 else round(rem / 100 + yuan, 2)
+    return -value if cents < 0 else value
 
 
 # ---------------------------------------------------------------------------
@@ -640,6 +648,31 @@ def record_payment(
     ).fetchone()
 
 
+def void_invoice(conn: sqlite3.Connection, invoice_code: str) -> sqlite3.Row:
+    """作废发票。
+
+    仅 unpaid 发票可作废：paid 发票拒绝、void 发票重复作废拒绝、
+    发票号不存在拒绝。作废只改状态，已有收款记录、已收金额、超收
+    余额及合同累计超额收款余额一律保持不变；作废后该发票不可再
+    登记收款（record_payment 已按状态拦截）。
+    """
+    invoice_code = require_text(invoice_code, "发票号")
+    invoice = get_invoice(conn, invoice_code)
+    if invoice is None:
+        raise LedgerError(f"发票号不存在：{invoice_code}")
+    if invoice["status"] == INVOICE_PAID:
+        raise LedgerError(f"发票已收款置为 paid，不得作废：{invoice_code}")
+    if invoice["status"] == INVOICE_VOID:
+        raise LedgerError(f"发票已作废，不能重复作废：{invoice_code}")
+    conn.execute(
+        "UPDATE invoices SET status = 'void' WHERE id = ?",
+        (invoice["id"],),
+    )
+    return conn.execute(
+        "SELECT * FROM invoices WHERE id = ?", (invoice["id"],)
+    ).fetchone()
+
+
 def query_payments(
     conn: sqlite3.Connection, contract_code: str
 ) -> tuple[sqlite3.Row, list[sqlite3.Row], int]:
@@ -652,6 +685,7 @@ def query_payments(
         """
         SELECT i.code AS invoice_code,
                m.code AS milestone_code,
+               m.due_date AS due_date,
                i.amount_cents,
                i.status,
                COALESCE(SUM(p.applied_cents), 0) AS received_cents,
@@ -801,11 +835,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(handler=cmd_record_payment)
 
     p = subparsers.add_parser(
+        "void-invoice",
+        help="作废发票",
+        description=(
+            "作废一张发票。仅状态为 unpaid 的发票可作废；paid 发票拒绝、"
+            "void 发票重复作废拒绝、发票号不存在拒绝。作废不改动该发票已有"
+            "收款记录的已收金额、超收余额及合同累计超额收款余额，作废后"
+            "不可再向该发票登记收款。"
+        ),
+    )
+    p.add_argument("--invoice", required=True, help="发票号")
+    p.set_defaults(handler=cmd_void_invoice)
+
+    p = subparsers.add_parser(
         "query-payment",
         help="查询合同的发票与收款",
-        description="按发票登记先后输出每张发票的金额、状态、已收与超收，不改动数据。",
+        description=(
+            "按发票登记先后以 JSON 数组输出每张发票的金额、状态、已收、"
+            "超收与账期风险，末尾追加合同汇总元素，不改动数据。"
+            "可用 --as-of YYYY-MM-DD 指定观察日期，省略时按运行当天。"
+        ),
     )
     p.add_argument("--contract", required=True, help="合同编号")
+    p.add_argument(
+        "--as-of",
+        dest="as_of",
+        help="观察日期（YYYY-MM-DD，省略时按运行当天）",
+    )
     p.set_defaults(handler=cmd_query_payment)
 
     return parser
@@ -898,17 +954,55 @@ def cmd_record_payment(args: argparse.Namespace, conn: sqlite3.Connection) -> in
     return 0
 
 
+def cmd_void_invoice(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:  # 单事务：失败自动回滚
+        invoice = void_invoice(conn, args.invoice)
+    print(f"发票已作废：{invoice['code']}")
+    return 0
+
+
 def cmd_query_payment(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
-    contract, rows, total_excess = query_payments(conn, args.contract)
-    for row in rows:
-        print(
-            f"{row['invoice_code']}  {row['milestone_code']}  "
-            f"金额：{format_yuan(int(row['amount_cents']))}  "
-            f"状态：{row['status']}  "
-            f"已收金额：{format_yuan(int(row['received_cents']))}  "
-            f"超收余额：{format_yuan(int(row['excess_cents']))}"
+    # 先严格校验观察日期，再读数据：任何失败都不产生 stdout、不改动数据。
+    if args.as_of is None:
+        as_of = date.today()
+    else:
+        as_of = date.fromisoformat(
+            parse_iso_date(args.as_of, field="观察日期")
         )
-    print(f"累计超额收款余额：{format_yuan(total_excess)}")
+    contract, rows, total_excess = query_payments(conn, args.contract)
+    elements: list[dict[str, object]] = []
+    total_overdue_cents = 0
+    for row in rows:
+        amount_cents = int(row["amount_cents"])
+        received_cents = int(row["received_cents"])
+        status = row["status"]
+        overdue_cents = (
+            amount_cents - received_cents
+            if status == INVOICE_UNPAID
+            else 0
+        )
+        total_overdue_cents += overdue_cents
+        due_date = date.fromisoformat(row["due_date"])
+        overdue_days = (as_of - due_date).days if as_of > due_date else 0
+        elements.append(
+            {
+                "invoice": row["invoice_code"],
+                "milestone": row["milestone_code"],
+                "amount": yuan_number(amount_cents),
+                "status": status,
+                "received": yuan_number(received_cents),
+                "excess": yuan_number(int(row["excess_cents"])),
+                "overdueDays": overdue_days,
+                "overdueAmount": yuan_number(overdue_cents),
+            }
+        )
+    elements.append(
+        {
+            "totalExcess": yuan_number(total_excess),
+            "totalOverdueAmount": yuan_number(total_overdue_cents),
+        }
+    )
+    print(json.dumps(elements, ensure_ascii=False))
     return 0
 
 

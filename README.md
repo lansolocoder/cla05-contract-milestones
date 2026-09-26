@@ -133,16 +133,49 @@ python3 -m contract_ledger record-payment \
   大于发票金额时同样视为 `paid`。作废（`void`）发票不可再登记收款。
 - 成功后输出收款单号、发票号、收款金额、入账金额与超收金额。
 
+### 作废发票
+
+```bash
+python3 -m contract_ledger void-invoice --invoice INV-001
+```
+
+- 仅状态为 `unpaid` 的发票可作废；`paid` 发票拒绝作废，已为 `void`
+  的发票重复作废拒绝，发票号不存在同样拒绝。
+- 作废只改变发票状态：该发票已有收款记录的已收金额、超收余额以及
+  合同累计超额收款余额均保持作废前数值不变。
+- 作废后该发票状态在 `query-payment` 中显示为字面值 `void`，此后
+  再向该发票登记收款一律拒绝。
+- 校验失败时非零状态退出、原因写标准错误，状态与全部金额保持不变。
+
 ### 查询收款
 
 ```bash
-python3 -m contract_ledger query-payment --contract HT-001
+python3 -m contract_ledger query-payment --contract HT-001 [--as-of 2026-06-30]
 ```
 
-按发票登记先后逐行输出：发票号、里程碑编号、金额、状态（字面值
-`paid`/`unpaid`/`void`）、已收金额、超收余额；末行输出该合同的累计
-超额收款余额（无超收时输出 `0`）。查询不改动任何数据；合同编号不存在
-则以非零状态退出并说明原因。
+输出为写到标准输出的 **JSON 数组**（不改动任何数据）。每张发票按登记
+先后对应一个元素，字段固定为：
+
+| 字段 | 含义 |
+| --- | --- |
+| `invoice` | 发票号 |
+| `milestone` | 里程碑编号 |
+| `amount` | 发票金额（元，数字） |
+| `status` | 字面值 `paid` / `unpaid` / `void` |
+| `received` | 已收金额（元，数字） |
+| `excess` | 该发票超收余额（元，数字） |
+| `overdueDays` | 逾期天数（整数）：观察日期晚于该发票所属里程碑到期日时为相差天数，早于或恰好等于到期日时为 `0` |
+| `overdueAmount` | 逾期未收金额：`status` 为 `unpaid` 时等于发票金额减已收金额，`paid` 或 `void` 时为 `0` |
+
+数组末尾额外追加一个汇总元素，只含两个字段：
+
+- `totalExcess`：合同累计超额收款余额（元，数字）；
+- `totalOverdueAmount`：全部发票 `overdueAmount` 之和（元，数字）。
+
+`--as-of` 指定观察日期（`YYYY-MM-DD`），省略时按运行当天。金额字段
+一律为元的数字（可含两位小数，无货币符号与千分位）。`--as-of` 格式
+非 `YYYY-MM-DD` 或日期非法时以非零状态退出、原因写标准错误、标准
+输出为空且不改动任何数据；合同编号不存在同样非零退出且不改动数据。
 
 ## 错误处理
 
