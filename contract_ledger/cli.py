@@ -96,6 +96,26 @@ def init_db(conn: sqlite3.Connection) -> None:
             effective_date TEXT,
             seq           INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS invoices (
+            id           INTEGER PRIMARY KEY,
+            code         TEXT NOT NULL UNIQUE,
+            milestone_id INTEGER NOT NULL
+                                 REFERENCES milestones(id),
+            amount_cents INTEGER NOT NULL CHECK (amount_cents > 0),
+            invoice_date TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS receipts (
+            id            INTEGER PRIMARY KEY,
+            code          TEXT NOT NULL UNIQUE,
+            milestone_id  INTEGER NOT NULL
+                                  REFERENCES milestones(id),
+            amount_cents  INTEGER NOT NULL CHECK (amount_cents > 0),
+            received_date TEXT NOT NULL,
+            reversed      INTEGER NOT NULL DEFAULT 0
+                                  CHECK (reversed IN (0, 1))
+        );
         """
     )
     # 旧版本数据库可能缺少里程碑相关列，原地补齐（均不影响既有数据）。
@@ -306,6 +326,140 @@ def set_milestone_due(
         (due_date, milestone["id"]),
     )
     return milestone_code, due_date
+
+
+# ---------------------------------------------------------------------------
+# 开票、收款与冲销（均在调用方提供的事务内执行）
+# ---------------------------------------------------------------------------
+
+def get_invoice(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM invoices WHERE code = ?", (code,)
+    ).fetchone()
+
+
+def get_receipt(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM receipts WHERE code = ?", (code,)
+    ).fetchone()
+
+
+def milestone_invoiced_cents(conn: sqlite3.Connection, milestone_id: int) -> int:
+    """该里程碑累计开票额（允许多张发票，不受当前金额上限约束）。"""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM invoices WHERE milestone_id = ?",
+        (milestone_id,),
+    ).fetchone()
+    return int(row[0])
+
+
+def milestone_received_cents(conn: sqlite3.Connection, milestone_id: int) -> int:
+    """该里程碑累计收款额（不含已冲销收款）。"""
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(amount_cents), 0)
+          FROM receipts
+         WHERE milestone_id = ?
+           AND reversed = 0
+        """,
+        (milestone_id,),
+    ).fetchone()
+    return int(row[0])
+
+
+def milestone_overreceipt_cents(
+    conn: sqlite3.Connection, milestone_id: int
+) -> int:
+    """超收余额 = max(0, 累计收款额 - 里程碑当前金额)。
+
+    冲销从累计收款额扣除其金额后重新计算，与“从超收余额中扣除其金额”
+    （以零为下限）等价。
+    """
+    return max(
+        0,
+        milestone_received_cents(conn, milestone_id)
+        - milestone_current_cents(conn, milestone_id),
+    )
+
+
+def register_invoice(
+    conn: sqlite3.Connection,
+    invoice_code: str,
+    milestone_code: str,
+    amount_text: str,
+    invoice_date_text: str,
+) -> tuple[str, int]:
+    invoice_code = require_text(invoice_code, "发票编号")
+    milestone_code = require_text(milestone_code, "里程碑编号")
+    amount_cents = parse_amount(
+        amount_text, field="开票金额", allow_negative=False
+    )
+    invoice_date = parse_iso_date(invoice_date_text, field="开票日期")
+    milestone = get_milestone(conn, milestone_code)
+    if milestone is None:
+        raise LedgerError(f"里程碑编号不存在：{milestone_code}")
+    if invoice_date < milestone["due_date"]:
+        raise LedgerError(
+            f"开票日期不得早于里程碑到期日：{invoice_date} 早于 "
+            f"{milestone['due_date']}"
+        )
+    if get_invoice(conn, invoice_code) is not None:
+        raise LedgerError(f"发票编号已存在，不得重复登记：{invoice_code}")
+    conn.execute(
+        """
+        INSERT INTO invoices (code, milestone_id, amount_cents, invoice_date)
+        VALUES (?, ?, ?, ?)
+        """,
+        (invoice_code, milestone["id"], amount_cents, invoice_date),
+    )
+    return invoice_code, milestone_invoiced_cents(conn, milestone["id"])
+
+
+def register_receipt(
+    conn: sqlite3.Connection,
+    receipt_code: str,
+    milestone_code: str,
+    amount_text: str,
+    received_date_text: str,
+) -> tuple[str, int, int]:
+    receipt_code = require_text(receipt_code, "收款编号")
+    milestone_code = require_text(milestone_code, "里程碑编号")
+    amount_cents = parse_amount(
+        amount_text, field="收款金额", allow_negative=False
+    )
+    received_date = parse_iso_date(received_date_text, field="收款日期")
+    milestone = get_milestone(conn, milestone_code)
+    if milestone is None:
+        raise LedgerError(f"里程碑编号不存在：{milestone_code}")
+    if get_receipt(conn, receipt_code) is not None:
+        raise LedgerError(f"收款编号已存在，不得重复登记：{receipt_code}")
+    conn.execute(
+        """
+        INSERT INTO receipts
+            (code, milestone_id, amount_cents, received_date, reversed)
+        VALUES (?, ?, ?, ?, 0)
+        """,
+        (receipt_code, milestone["id"], amount_cents, received_date),
+    )
+    total_received = milestone_received_cents(conn, milestone["id"])
+    overreceipt = milestone_overreceipt_cents(conn, milestone["id"])
+    return receipt_code, total_received, overreceipt
+
+
+def reverse_receipt(
+    conn: sqlite3.Connection, receipt_code: str
+) -> tuple[str, int]:
+    receipt_code = require_text(receipt_code, "收款编号")
+    receipt = get_receipt(conn, receipt_code)
+    if receipt is None:
+        raise LedgerError(f"收款编号不存在：{receipt_code}")
+    if receipt["reversed"]:
+        raise LedgerError(f"收款已冲销，不得再次冲销：{receipt_code}")
+    conn.execute(
+        "UPDATE receipts SET reversed = 1 WHERE id = ?", (receipt["id"],)
+    )
+    overreceipt = milestone_overreceipt_cents(conn, receipt["milestone_id"])
+    return receipt_code, overreceipt
 
 
 def current_cents(conn: sqlite3.Connection, contract_id: int) -> int:
@@ -549,6 +703,48 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(handler=cmd_set_milestone_due)
 
     p = subparsers.add_parser(
+        "register-invoice",
+        aliases=["add-invoice"],
+        help="开票登记",
+        description=(
+            "为已有里程碑登记一张发票。发票编号全局唯一，金额为正数，"
+            "开票日期不得早于该里程碑到期日。同一里程碑允许多张发票，"
+            "累计开票额不受里程碑当前金额上限约束。"
+        ),
+    )
+    p.add_argument("--invoice", required=True, help="发票编号（全局唯一）")
+    p.add_argument("--milestone", required=True, help="里程碑编号（必须存在）")
+    p.add_argument("--amount", required=True, help="开票金额（元，正数，最多两位小数）")
+    p.add_argument("--date", required=True, help="开票日期（YYYY-MM-DD，不得早于里程碑到期日）")
+    p.set_defaults(handler=cmd_register_invoice)
+
+    p = subparsers.add_parser(
+        "register-receipt",
+        aliases=["add-receipt"],
+        help="收款登记",
+        description=(
+            "为已有里程碑登记一笔收款。收款编号全局唯一，金额为正数；"
+            "金额超过里程碑当前金额的差额记为超收余额，仍允许登记成功。"
+        ),
+    )
+    p.add_argument("--receipt", required=True, help="收款编号（全局唯一）")
+    p.add_argument("--milestone", required=True, help="里程碑编号（必须存在）")
+    p.add_argument("--amount", required=True, help="收款金额（元，正数，最多两位小数）")
+    p.add_argument("--date", required=True, help="收款日期（YYYY-MM-DD）")
+    p.set_defaults(handler=cmd_register_receipt)
+
+    p = subparsers.add_parser(
+        "reverse-receipt",
+        help="收款冲销",
+        description=(
+            "对已登记收款做冲销，其金额从累计收款额与超收余额中扣除；"
+            "已冲销收款不得再次冲销。"
+        ),
+    )
+    p.add_argument("--receipt", required=True, help="收款编号（必须存在且未冲销）")
+    p.set_defaults(handler=cmd_reverse_receipt)
+
+    p = subparsers.add_parser(
         "effect-change",
         help="变更单生效",
         description="把草稿变更单置为已生效；生效后当前金额必须大于零。",
@@ -631,6 +827,35 @@ def cmd_void_change(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     return 0
 
 
+def cmd_register_invoice(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:  # 单事务：失败自动回滚
+        code, invoiced_cents = register_invoice(
+            conn, args.invoice, args.milestone, args.amount, args.date
+        )
+    print(f"发票编号：{code}")
+    print(f"累计开票：{format_yuan(invoiced_cents)}")
+    return 0
+
+
+def cmd_register_receipt(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:  # 单事务：失败自动回滚
+        code, received_cents, overreceipt_cents = register_receipt(
+            conn, args.receipt, args.milestone, args.amount, args.date
+        )
+    print(f"收款编号：{code}")
+    print(f"累计收款：{format_yuan(received_cents)}")
+    print(f"超收余额：{format_yuan(overreceipt_cents)}")
+    return 0
+
+
+def cmd_reverse_receipt(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:  # 单事务：失败自动回滚
+        code, overreceipt_cents = reverse_receipt(conn, args.receipt)
+    print(f"收款编号：{code}")
+    print(f"超收余额：{format_yuan(overreceipt_cents)}")
+    return 0
+
+
 def cmd_query_contract(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     contract, changes, milestones = query_contract(conn, args.code)
     amount = current_cents(conn, contract["id"])
@@ -643,9 +868,15 @@ def cmd_query_contract(args: argparse.Namespace, conn: sqlite3.Connection) -> in
         print("里程碑：")
         for ms in milestones:
             current = milestone_current_cents(conn, ms["id"])
+            invoiced = milestone_invoiced_cents(conn, ms["id"])
+            received = milestone_received_cents(conn, ms["id"])
+            overreceipt = max(0, received - current)
             print(
                 f"  - {ms['code']}  名称：{ms['name']}  "
-                f"到期日：{ms['due_date']}  当前金额：{format_yuan(current)}"
+                f"到期日：{ms['due_date']}  当前金额：{format_yuan(current)}  "
+                f"累计开票：{format_yuan(invoiced)}  "
+                f"累计收款：{format_yuan(received)}  "
+                f"超收：{format_yuan(overreceipt)}"
             )
     else:
         print("里程碑：无")
