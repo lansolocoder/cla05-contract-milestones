@@ -96,6 +96,18 @@ def init_db(conn: sqlite3.Connection) -> None:
             effective_date TEXT,
             seq           INTEGER NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS payments (
+            id            INTEGER PRIMARY KEY,
+            code          TEXT NOT NULL UNIQUE,
+            contract_id   INTEGER NOT NULL
+                                  REFERENCES contracts(id),
+            milestone_id  INTEGER
+                                  REFERENCES milestones(id),
+            amount_cents  INTEGER NOT NULL CHECK (amount_cents > 0),
+            payment_date  TEXT NOT NULL,
+            seq           INTEGER NOT NULL
+        );
         """
     )
     # 旧版本数据库可能缺少里程碑相关列，原地补齐（均不影响既有数据）。
@@ -462,9 +474,116 @@ def void_change(conn: sqlite3.Connection, change_code: str) -> sqlite3.Row:
     return _transition(conn, change_code, action="void")
 
 
+def get_payment(conn: sqlite3.Connection, code: str) -> sqlite3.Row | None:
+    return conn.execute(
+        "SELECT * FROM payments WHERE code = ?", (code,)
+    ).fetchone()
+
+
+def list_payments(
+    conn: sqlite3.Connection, contract_id: int
+) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM payments WHERE contract_id = ? ORDER BY seq",
+        (contract_id,),
+    ).fetchall()
+
+
+def contract_payment_sum(conn: sqlite3.Connection, contract_id: int) -> int:
+    """合同级收款合计：合同级收款单与归属里程碑的收款单全部计入。"""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE contract_id = ?",
+        (contract_id,),
+    ).fetchone()
+    return int(row[0])
+
+
+def milestone_payment_sum(conn: sqlite3.Connection, milestone_id: int) -> int:
+    """该里程碑全部收款单的金额合计。"""
+    row = conn.execute(
+        "SELECT COALESCE(SUM(amount_cents), 0) FROM payments WHERE milestone_id = ?",
+        (milestone_id,),
+    ).fetchone()
+    return int(row[0])
+
+
+def record_payment(
+    conn: sqlite3.Connection,
+    contract_code: str,
+    payment_code: str,
+    amount_text: str,
+    date_text: str,
+    milestone_code: str | None = None,
+) -> tuple[str, int]:
+    """登记收款单（登记即生效），返回编号与对应口径下的登记后收款合计。"""
+    contract_code = require_text(contract_code, "合同编号")
+    payment_code = require_text(payment_code, "收款单编号")
+    amount_cents = parse_amount(
+        amount_text, field="收款金额", allow_negative=False
+    )
+    payment_date = parse_iso_date(date_text, field="收款日期")
+    contract = get_contract(conn, contract_code)
+    if contract is None:
+        raise LedgerError(f"引用的合同编号不存在：{contract_code}")
+    milestone_id = None
+    if milestone_code is not None:
+        milestone_code = require_text(milestone_code, "里程碑编号")
+        milestone = get_milestone(conn, milestone_code)
+        if milestone is None:
+            raise LedgerError(f"里程碑编号不存在：{milestone_code}")
+        if milestone["contract_id"] != contract["id"]:
+            raise LedgerError(
+                f"里程碑不属于该合同：里程碑 {milestone_code} "
+                f"不属于合同 {contract_code}"
+            )
+        milestone_id = milestone["id"]
+    if payment_date < contract["signed_date"]:
+        raise LedgerError(
+            f"收款日期不得早于合同签订日期：{payment_date} "
+            f"早于 {contract['signed_date']}"
+        )
+    if get_payment(conn, payment_code) is not None:
+        raise LedgerError(f"收款单编号已存在，不得重复登记：{payment_code}")
+
+    # 未超收校验：合同级合计不得超过合同当前金额；归属里程碑时该里程碑
+    # 合计同样不得超过里程碑当前金额。任一超出即整体拒绝，不写入。
+    contract_total = contract_payment_sum(conn, contract["id"]) + amount_cents
+    if contract_total > current_cents(conn, contract["id"]):
+        raise LedgerError(
+            f"登记后合同级收款合计将超过合同当前金额，拒绝登记：{payment_code}"
+        )
+    if milestone_id is not None:
+        milestone_total = (
+            milestone_payment_sum(conn, milestone_id) + amount_cents
+        )
+        if milestone_total > milestone_current_cents(conn, milestone_id):
+            raise LedgerError(
+                f"登记后里程碑收款合计将超过里程碑当前金额，拒绝登记：{payment_code}"
+            )
+    else:
+        milestone_total = 0
+
+    next_seq = conn.execute(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM payments WHERE contract_id = ?",
+        (contract["id"],),
+    ).fetchone()[0]
+    conn.execute(
+        """
+        INSERT INTO payments
+            (code, contract_id, milestone_id, amount_cents, payment_date, seq)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (payment_code, contract["id"], milestone_id, amount_cents,
+         payment_date, next_seq),
+    )
+    if milestone_id is not None:
+        return payment_code, milestone_total
+    return payment_code, contract_total
+
+
 def query_contract(
     conn: sqlite3.Connection, code: str
-) -> tuple[sqlite3.Row, list[sqlite3.Row], list[sqlite3.Row]]:
+) -> tuple[sqlite3.Row, list[sqlite3.Row], list[sqlite3.Row], list[sqlite3.Row]]:
     code = require_text(code, "合同编号")
     contract = get_contract(conn, code)
     if contract is None:
@@ -474,7 +593,8 @@ def query_contract(
         (contract["id"],),
     ).fetchall()
     milestones = list_milestones(conn, contract["id"])
-    return contract, changes, milestones
+    payments = list_payments(conn, contract["id"])
+    return contract, changes, milestones, payments
 
 
 # ---------------------------------------------------------------------------
@@ -565,6 +685,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(handler=cmd_void_change)
 
     p = subparsers.add_parser(
+        "record-payment",
+        help="登记收款单",
+        description=(
+            "为已有合同登记收款单，登记即生效。收款单编号全局唯一，金额为正数，"
+            "收款日期不得早于合同签订日期；可用 --milestone 归属到该合同下的"
+            "里程碑，省略则计入合同级收款合计。合同级与里程碑级均不允许超收。"
+        ),
+    )
+    p.add_argument("--contract", required=True, help="所属合同编号")
+    p.add_argument("--code", required=True, help="收款单编号（全局唯一）")
+    p.add_argument("--amount", required=True, help="收款金额（元，正数，最多两位小数）")
+    p.add_argument("--date", required=True, help="收款日期（YYYY-MM-DD，不得早于合同签订日期）")
+    p.add_argument(
+        "--milestone",
+        help="归属里程碑编号（省略则计入合同级收款合计；指定时必须属于该合同）",
+    )
+    p.set_defaults(handler=cmd_record_payment)
+
+    p = subparsers.add_parser(
         "query-contract",
         aliases=["show-contract"],
         help="查询合同及其全部变更单",
@@ -631,8 +770,19 @@ def cmd_void_change(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
     return 0
 
 
+def cmd_record_payment(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
+    with conn:  # 单事务：失败自动回滚
+        code, total_cents = record_payment(
+            conn, args.contract, args.code, args.amount, args.date,
+            milestone_code=args.milestone,
+        )
+    print(f"收款单编号：{code}")
+    print(f"收款合计：{format_yuan(total_cents)}")
+    return 0
+
+
 def cmd_query_contract(args: argparse.Namespace, conn: sqlite3.Connection) -> int:
-    contract, changes, milestones = query_contract(conn, args.code)
+    contract, changes, milestones, payments = query_contract(conn, args.code)
     amount = current_cents(conn, contract["id"])
     print(f"合同编号：{contract['code']}")
     print(f"客户名称：{contract['customer']}")
@@ -663,6 +813,21 @@ def cmd_query_contract(args: argparse.Namespace, conn: sqlite3.Connection) -> in
             )
     else:
         print("变更单：无")
+    if payments:
+        milestone_codes = {ms["id"]: ms["code"] for ms in milestones}
+        total = contract_payment_sum(conn, contract["id"])
+        print(f"收款合计：{format_yuan(total)}")
+        for p in payments:
+            if p["milestone_id"] is None:
+                attribution = "归属：合同"
+            else:
+                attribution = f"归属：{milestone_codes[p['milestone_id']]}"
+            print(
+                f"  - {p['code']}  金额：{format_yuan(p['amount_cents'])}  "
+                f"日期：{p['payment_date']}  {attribution}"
+            )
+    else:
+        print("收款：无")
     return 0
 
 
